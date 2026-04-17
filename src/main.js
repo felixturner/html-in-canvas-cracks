@@ -1,17 +1,37 @@
 import * as THREE from 'three/webgpu';
-import { uv, vec4, texture } from 'three/tsl';
+import {
+  uv,
+  vec2,
+  vec4,
+  vec3,
+  texture,
+  float,
+  uniform,
+  attribute,
+  step,
+  pass,
+  positionView,
+  normalView,
+  oneMinus,
+} from 'three/tsl';
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { MathUtils } from 'three';
 import gsap from 'gsap';
-import { computeFaces, triangulateFace } from './shatter.js';
+import { computeFaces, triangulateFace, pointInPolygon } from './shatter.js';
+import { playCrack, startGamma, setGammaVolume } from './sfx.js';
+import { createTunnel, waitForTunnelFont } from './tunnel.js';
 
 const source = document.getElementById('source');
 const stage = document.getElementById('stage');
 const divider = document.getElementById('divider');
 const warning = document.getElementById('warning');
-const page = source.querySelector('.gh-page');
+const nativePage = document.getElementById('native-page');
+const page = nativePage.cloneNode(true);
+page.id = 'canvas-page';
+source.appendChild(page);
 const ctx2d = source.getContext('2d');
 
 if (typeof ctx2d.drawElementImage !== 'function') {
@@ -23,12 +43,69 @@ if (typeof ctx2d.drawElementImage !== 'function') {
 
 const scene = new THREE.Scene();
 const FOV = 60;
-const camera = new THREE.PerspectiveCamera(FOV, 1, 0.01, 100);
-camera.position.set(0, 0, 1 / Math.tan((FOV / 2) * Math.PI / 180));
+const camera = new THREE.PerspectiveCamera(FOV, 1, 0.01, 200);
+camera.position.set(0, 0, 1 / Math.tan(((FOV / 2) * Math.PI) / 180));
 camera.lookAt(0, 0, 0);
+
+scene.fog = new THREE.Fog(0x000000, 8, 60);
 
 const sceneRoot = new THREE.Group();
 scene.add(sceneRoot);
+
+const timer = new THREE.Timer();
+const tunnelScene = new THREE.Scene();
+let tunnelApi = null;
+
+// Feedback/decay setup — render tunnel to this RT each frame, with a decay
+// quad that fades the prior frame for trailing effect.
+const rtOpts = {
+  type: THREE.HalfFloatType,
+  magFilter: THREE.LinearFilter,
+  minFilter: THREE.LinearFilter,
+  colorSpace: THREE.LinearSRGBColorSpace,
+  depthBuffer: false,
+  stencilBuffer: false,
+};
+const feedbackRT = new THREE.RenderTarget(1, 1, rtOpts);
+// foreground RT for shards — needs depth buffer, alpha-cleared each frame
+const fgRT = new THREE.RenderTarget(1, 1, {
+  type: THREE.HalfFloatType,
+  magFilter: THREE.LinearFilter,
+  minFilter: THREE.LinearFilter,
+  colorSpace: THREE.LinearSRGBColorSpace,
+});
+const decayScene = new THREE.Scene();
+const decayCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const decayAlphaU = uniform(0.26);
+const crackColorU = uniform(1.0);
+const crackOpacityU = uniform(0.1);
+const decayMat = new THREE.MeshBasicNodeMaterial({
+  transparent: true,
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+});
+decayMat.colorNode = vec4(float(0), float(0), float(0), decayAlphaU);
+const decayQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), decayMat);
+decayQuad.frustumCulled = false;
+decayScene.add(decayQuad);
+
+// display scene: fullscreen quad sampling feedbackRT, fed into bloom pass.
+const displayScene = new THREE.Scene();
+const displayMat = new THREE.MeshBasicNodeMaterial({
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+});
+displayMat.colorNode = texture(feedbackRT.texture, uv());
+const displayQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), displayMat);
+displayQuad.frustumCulled = false;
+displayScene.add(displayQuad);
+
+waitForTunnelFont().then(() => {
+  tunnelApi = createTunnel({ aspect: window.innerWidth / window.innerHeight });
+  tunnelScene.add(tunnelApi.group);
+});
 
 let htmlTexture = null;
 let mesh = null;
@@ -63,7 +140,7 @@ const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
 scene.environmentIntensity = 0;
 
-new RGBELoader().load('/studio_kominka_01_1k.hdr', (hdr) => {
+new HDRLoader().load('/studio_kominka_01_1k.hdr', (hdr) => {
   hdr.mapping = THREE.EquirectangularReflectionMapping;
   scene.environment = pmrem.fromEquirectangular(hdr).texture;
   hdr.dispose();
@@ -90,94 +167,126 @@ function schedulePaint() {
 
 const debug = document.getElementById('debug');
 
-const cracks = [];
+function findShardAt(p, excludeShard) {
+  for (const m of shardMeshes) {
+    if (m === excludeShard) continue;
+    if (pointInPolygon(p, m.userData.polygon)) return m;
+  }
+  return null;
+}
 
-function growBranch(x, y, angle, steps, depth) {
+function addSegToShard(map, shardMesh, seg) {
+  let arr = map.get(shardMesh);
+  if (!arr) {
+    arr = [];
+    map.set(shardMesh, arr);
+  }
+  arr.push(seg);
+}
+
+function walkBranch(x, y, angle, startShard, segsByShard, allSegs, steps, depth) {
   if (depth > 3) return;
+  let cx = x,
+    cy = y,
+    ca = angle;
+  let currentShard = startShard;
   for (let i = 0; i < steps; i++) {
-    angle += (Math.random() - 0.5) * 1.3;
-    const nx = x + Math.cos(angle) * 60;
-    const ny = y + Math.sin(angle) * 60;
-    cracks.push([x, y, nx, ny]);
-    x = nx;
-    y = ny;
+    ca += MathUtils.randFloatSpread(1.3);
+    const nx = cx + Math.cos(ca) * 60;
+    const ny = cy + Math.sin(ca) * 60;
+    const np = { x: nx, y: ny };
+    const seg = [cx, cy, nx, ny, depth];
+    allSegs.push(seg);
+    if (currentShard) {
+      addSegToShard(segsByShard, currentShard, seg);
+      if (!pointInPolygon(np, currentShard.userData.polygon)) {
+        const nextShard = findShardAt(np, currentShard);
+        if (nextShard) {
+          addSegToShard(segsByShard, nextShard, seg);
+        }
+        currentShard = nextShard;
+      }
+    }
+    cx = nx;
+    cy = ny;
     if (Math.random() < 0.18 * Math.pow(0.6, depth)) {
       const side = Math.random() < 0.5 ? -1 : 1;
-      const branchAngle = angle + side * (Math.PI / 3 + (Math.random() - 0.5) * 0.4);
-      growBranch(x, y, branchAngle, Math.floor(steps * 0.7), depth + 1);
+      const ba = ca + side * (Math.PI / 3 + MathUtils.randFloatSpread(0.4));
+      walkBranch(
+        cx,
+        cy,
+        ba,
+        currentShard,
+        segsByShard,
+        allSegs,
+        Math.floor(steps * 0.7),
+        depth + 1,
+      );
     }
   }
 }
 
-function walkMainCrack(x, y, angle) {
-  const w = source.width;
-  const h = source.height;
-  const sy = window.scrollY;
-  const minX = -50, maxX = w + 50;
-  const minY = sy - 50, maxY = sy + h + 50;
-  let cx = x, cy = y, ca = angle;
-  while (cx > minX && cx < maxX && cy > minY && cy < maxY) {
-    ca += (Math.random() - 0.5) * 0.3;
+function walkMainCrack(x, y, angle, startShard, segsByShard, allSegs) {
+  let cx = x,
+    cy = y,
+    ca = angle;
+  let currentShard = startShard;
+  let safety = 0;
+  while (safety++ < 200) {
+    if (!currentShard) return;
+    ca += MathUtils.randFloatSpread(0.3);
     const nx = cx + Math.cos(ca) * 60;
     const ny = cy + Math.sin(ca) * 60;
-    cracks.push([cx, cy, nx, ny]);
+    const np = { x: nx, y: ny };
+    const seg = [cx, cy, nx, ny, 0];
+    allSegs.push(seg);
+    addSegToShard(segsByShard, currentShard, seg);
+    if (!pointInPolygon(np, currentShard.userData.polygon)) {
+      const nextShard = findShardAt(np, currentShard);
+      if (nextShard) {
+        addSegToShard(segsByShard, nextShard, seg);
+      }
+      currentShard = nextShard;
+    }
     cx = nx;
     cy = ny;
     if (Math.random() < 0.22) {
       const side = Math.random() < 0.5 ? -1 : 1;
-      const ba = ca + side * (Math.PI / 3 + (Math.random() - 0.5) * 0.4);
-      growBranch(cx, cy, ba, 3, 1);
+      const ba = ca + side * (Math.PI / 3 + MathUtils.randFloatSpread(0.4));
+      walkBranch(cx, cy, ba, currentShard, segsByShard, allSegs, 3, 1);
     }
   }
 }
 
-function seedCrack(x, y) {
+function propagateCracks(x, y, startShard) {
+  const segsByShard = new Map();
+  const allSegs = [];
   const mainAngle = Math.random() * Math.PI;
-  walkMainCrack(x, y, mainAngle);
-  walkMainCrack(x, y, mainAngle + Math.PI);
+  walkMainCrack(x, y, mainAngle, startShard, segsByShard, allSegs);
+  walkMainCrack(x, y, mainAngle + Math.PI, startShard, segsByShard, allSegs);
+  return { segsByShard, allSegs };
 }
 
-const crackGeometry = new THREE.BufferGeometry();
-crackGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
-const crackMaterial = new THREE.LineBasicNodeMaterial({
-  color: 0xffffff,
-  transparent: true,
-  depthTest: false,
-  depthWrite: false,
-});
-const crackLines = new THREE.LineSegments(crackGeometry, crackMaterial);
-crackLines.frustumCulled = false;
-crackLines.renderOrder = 1;
-sceneRoot.add(crackLines);
-
-function updateCrackGeometry() {
-  const n = cracks.length;
-  if (n === 0) {
-    crackGeometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(0), 3));
-    return;
+function computeTipInfo(segs) {
+  const tol = 0.5;
+  const keyFn = (x, y) => `${Math.round(x / tol)},${Math.round(y / tol)}`;
+  const counts = new Map();
+  for (const seg of segs) {
+    const k0 = keyFn(seg[0], seg[1]);
+    const k1 = keyFn(seg[2], seg[3]);
+    counts.set(k0, (counts.get(k0) || 0) + 1);
+    counts.set(k1, (counts.get(k1) || 0) + 1);
   }
-  const arr = new Float32Array(n * 6);
-  const w = source.width;
-  const h = source.height;
-  const sy = window.scrollY;
-  for (let i = 0; i < n; i++) {
-    const s = cracks[i];
-    arr[i * 6 + 0] = (s[0] / w) * 2 - 1;
-    arr[i * 6 + 1] = 1 - ((s[1] - sy) / h) * 2;
-    arr[i * 6 + 2] = 0;
-    arr[i * 6 + 3] = (s[2] / w) * 2 - 1;
-    arr[i * 6 + 4] = 1 - ((s[3] - sy) / h) * 2;
-    arr[i * 6 + 5] = 0;
-  }
-  crackGeometry.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  const tips = new Set();
+  for (const [k, c] of counts) if (c === 1) tips.add(k);
+  return { tips, keyFn };
 }
 
 function paint() {
   try {
-    ctx2d.clearRect(0, 0, source.width, source.height);
-    ctx2d.drawElementImage(page, 0, -window.scrollY);
+    ctx2d.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    ctx2d.drawElementImage(page, 0, 0);
     htmlTexture.needsUpdate = true;
-    updateCrackGeometry();
     const contentH = page.offsetHeight;
     if (contentH > 0 && contentH !== lastContentH) {
       document.body.style.minHeight = contentH + 'px';
@@ -195,24 +304,41 @@ function paint() {
   }
 }
 
-let split = 0.8;
+let split = 0.9;
+let htmlSplit = 0.95;
+const dividerHtml = document.getElementById('divider-html');
 
 function applySplit() {
-  divider.style.left = (split * 100) + 'vw';
+  divider.style.left = split * 100 + 'vw';
   stage.style.clipPath = `inset(0 ${(1 - split) * 100}% 0 0)`;
+  dividerHtml.style.left = htmlSplit * 100 + 'vw';
+  // Source spans [0, htmlSplit] — stage occludes [0, split] visually, but
+  // pointer-events pass through stage so hovers/selection reach source.
+  source.style.clipPath = `inset(0 ${(1 - htmlSplit) * 100}% 0 0)`;
 }
 
 function resize() {
   const w = window.innerWidth;
-  const h = window.innerHeight;
-  source.width = w;
-  source.height = h;
+  const vh = window.innerHeight;
+  const fullH = Math.max(vh, document.documentElement.scrollHeight);
+  const srcDpr = Math.min(window.devicePixelRatio, 2);
+  source.width = Math.floor(w * srcDpr);
+  source.height = Math.floor(fullH * srcDpr);
+  source.style.width = w + 'px';
+  source.style.height = fullH + 'px';
   createPipeline();
-  renderer.setSize(w, h, false);
-  const aspect = w / h;
+  renderer.setPixelRatio(srcDpr);
+  renderer.setSize(w, fullH, false);
+  const aspect = w / fullH;
   camera.aspect = aspect;
   camera.updateProjectionMatrix();
   sceneRoot.scale.set(aspect, 1, 1);
+  if (tunnelApi) tunnelApi.updateAspect(aspect);
+  const dpr = Math.min(window.devicePixelRatio, 2);
+  const rw = Math.max(1, Math.floor(w * dpr));
+  const rh = Math.max(1, Math.floor(fullH * dpr));
+  feedbackRT.setSize(rw, rh);
+  fgRT.setSize(rw, rh);
   applySplit();
   paint();
 }
@@ -232,7 +358,48 @@ divider.addEventListener('pointerup', (e) => {
   divider.releasePointerCapture(e.pointerId);
 });
 
+dividerHtml.addEventListener('pointerdown', (e) => {
+  dividerHtml.classList.add('dragging');
+  dividerHtml.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+dividerHtml.addEventListener('pointermove', (e) => {
+  if (!dividerHtml.hasPointerCapture(e.pointerId)) return;
+  htmlSplit = Math.max(0.0, Math.min(1.0, e.clientX / window.innerWidth));
+  applySplit();
+});
+dividerHtml.addEventListener('pointerup', (e) => {
+  dividerHtml.classList.remove('dragging');
+  dividerHtml.releasePointerCapture(e.pointerId);
+});
+
 source.onpaint = schedulePaint;
+
+const themeToggle = document.getElementById('theme-toggle');
+const themeToggleHit = document.getElementById('theme-toggle-hit');
+function syncThemeHit() {
+  const r = themeToggle.getBoundingClientRect();
+  themeToggleHit.style.left = r.left + 'px';
+  themeToggleHit.style.top = r.top + 'px';
+  themeToggleHit.style.width = r.width + 'px';
+  themeToggleHit.style.height = r.height + 'px';
+}
+syncThemeHit();
+window.addEventListener('resize', syncThemeHit);
+window.addEventListener('scroll', syncThemeHit, { passive: true });
+themeToggleHit.addEventListener('click', (e) => {
+  e.stopPropagation();
+  themeToggle.click();
+});
+themeToggle.addEventListener('click', () => {
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const nextLight = !isLight;
+  document.documentElement.setAttribute('data-theme', nextLight ? 'light' : 'dark');
+  themeToggle.textContent = nextLight ? '☀' : '☾';
+  crackColorU.value = nextLight ? 0.0 : 1.0;
+  crackOpacityU.value = nextLight ? 0.2 : 0.1;
+  schedulePaint();
+});
 window.addEventListener('resize', resize);
 window.addEventListener('scroll', schedulePaint, { passive: true });
 new ResizeObserver(schedulePaint).observe(page);
@@ -240,8 +407,57 @@ new ResizeObserver(schedulePaint).observe(page);
 window.addEventListener('click', (e) => {
   if (controls.enabled) return;
   if (e.target.closest('#divider')) return;
-  seedCrack(e.clientX, e.clientY + window.scrollY);
-  buildShards();
+  if (e.target.closest('#divider-html')) return;
+  if (e.target.closest('#theme-toggle')) return;
+  const dpr = Math.min(window.devicePixelRatio, 2);
+  const x = e.clientX * dpr;
+  const y = (e.clientY + window.scrollY) * dpr;
+  if (shardMeshes.length === 0 && rootRect === null) {
+    initializeRootShard();
+    if (mesh) mesh.visible = false;
+  }
+  const hit = hitShard(x, y);
+  if (!hit) return;
+  playCrack();
+  startGamma();
+  const { segsByShard, allSegs } = propagateCracks(x, y, hit);
+  const tipInfo = computeTipInfo(allSegs);
+  for (const seg of allSegs) {
+    const [x0, y0, x1, y1, depth] = seg;
+    const baseW = widthForDepth(depth);
+    seg[5] = tipInfo.tips.has(tipInfo.keyFn(x0, y0)) ? 0 : baseW;
+    seg[6] = tipInfo.tips.has(tipInfo.keyFn(x1, y1)) ? 0 : baseW;
+  }
+  const clickPoint = { x, y };
+  let maxDist = 1;
+  for (const seg of allSegs) {
+    const d0 = Math.hypot(seg[0] - x, seg[1] - y);
+    const d1 = Math.hypot(seg[2] - x, seg[3] - y);
+    if (d0 > maxDist) maxDist = d0;
+    if (d1 > maxDist) maxDist = d1;
+  }
+  const newMeshes = [];
+  for (const [shard, segs] of segsByShard) {
+    const created = fractureShardWithCracks(shard, segs, clickPoint, maxDist);
+    newMeshes.push(...created);
+  }
+  const screenArea = source.width * source.height;
+  const frac = screenArea > 0 ? droppedArea / screenArea : 0;
+  setGammaVolume(Math.min(1, frac));
+  for (const m of newMeshes) {
+    const prog = m.userData.lineProgress;
+    if (!prog) continue;
+    prog.value = 0;
+    const tracker = { v: 0 };
+    gsap.to(tracker, {
+      v: 1,
+      duration: GROW_DURATION,
+      ease: 'power2.out',
+      onUpdate() {
+        prog.value = tracker.v;
+      },
+    });
+  }
   schedulePaint();
 });
 
@@ -249,23 +465,33 @@ resize();
 
 const stats = new Stats();
 stats.dom.style.position = 'fixed';
-stats.dom.style.top = '8px';
-stats.dom.style.right = '8px';
-stats.dom.style.left = 'auto';
+stats.dom.style.bottom = '8px';
+stats.dom.style.left = '8px';
+stats.dom.style.top = 'auto';
+stats.dom.style.right = 'auto';
 stats.dom.style.zIndex = '100';
 stats.dom.style.pointerEvents = 'none';
 document.body.appendChild(stats.dom);
 
 let shardMeshes = [];
-let shardBuildScrollY = 0;
 let exploded = false;
+let rootRect = null;
+let shardHueCounter = 0;
+
+// Fresnel rim light — shared across all shard materials
+const rimStrengthU = uniform(0.8);
+const RIM_COLOR = new THREE.Color(0, 1, 0.4);
+const rimFactor = oneMinus(normalView.dot(positionView.normalize().negate()).abs()).pow(3);
+const rimR = float(RIM_COLOR.r).mul(rimFactor).mul(rimStrengthU);
+const rimG = float(RIM_COLOR.g).mul(rimFactor).mul(rimStrengthU);
+const rimB = float(RIM_COLOR.b).mul(rimFactor).mul(rimStrengthU);
+
+const pageBgColor = new THREE.Color(getComputedStyle(page).backgroundColor);
+const pageBgLum = pageBgColor.r * 0.299 + pageBgColor.g * 0.587 + pageBgColor.b * 0.114;
 
 function updateShardScroll() {
-  if (exploded) return;
-  if (shardMeshes.length === 0) return;
-  const h = source.height;
-  const ndcOffset = ((window.scrollY - shardBuildScrollY) / h) * 2;
-  for (const m of shardMeshes) m.position.y = m.userData.centroid.y + ndcOffset;
+  // stage canvas is full-doc absolute-positioned and scrolls with page,
+  // so shards don't need per-frame scroll compensation.
 }
 
 function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depthNdc) {
@@ -305,11 +531,7 @@ function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depth
 
   // top triangles (reversed winding so +Z face is front-facing correctly)
   for (let i = 0; i < topTriIndices.length; i += 3) {
-    indices.push(
-      topTriIndices[i + 0],
-      topTriIndices[i + 2],
-      topTriIndices[i + 1]
-    );
+    indices.push(topTriIndices[i + 0], topTriIndices[i + 2], topTriIndices[i + 1]);
   }
   // bottom triangles (direct, offset by n)
   for (let i = 0; i < topTriIndices.length; i++) {
@@ -337,10 +559,18 @@ function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depth
     const v2 = sideBase + i * 4 + 2; // bot-ni
     const v3 = sideBase + i * 4 + 3; // bot-i
 
-    positions[v0 * 3 + 0] = ax; positions[v0 * 3 + 1] = ay; positions[v0 * 3 + 2] = topZ;
-    positions[v1 * 3 + 0] = bx; positions[v1 * 3 + 1] = by; positions[v1 * 3 + 2] = topZ;
-    positions[v2 * 3 + 0] = bx; positions[v2 * 3 + 1] = by; positions[v2 * 3 + 2] = botZ;
-    positions[v3 * 3 + 0] = ax; positions[v3 * 3 + 1] = ay; positions[v3 * 3 + 2] = botZ;
+    positions[v0 * 3 + 0] = ax;
+    positions[v0 * 3 + 1] = ay;
+    positions[v0 * 3 + 2] = topZ;
+    positions[v1 * 3 + 0] = bx;
+    positions[v1 * 3 + 1] = by;
+    positions[v1 * 3 + 2] = topZ;
+    positions[v2 * 3 + 0] = bx;
+    positions[v2 * 3 + 1] = by;
+    positions[v2 * 3 + 2] = botZ;
+    positions[v3 * 3 + 0] = ax;
+    positions[v3 * 3 + 1] = ay;
+    positions[v3 * 3 + 2] = botZ;
 
     for (const v of [v0, v1, v2, v3]) {
       normals[v * 3 + 0] = nx;
@@ -348,10 +578,14 @@ function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depth
       normals[v * 3 + 2] = 0;
     }
 
-    uvs[v0 * 2 + 0] = 0; uvs[v0 * 2 + 1] = 0;
-    uvs[v1 * 2 + 0] = 1; uvs[v1 * 2 + 1] = 0;
-    uvs[v2 * 2 + 0] = 1; uvs[v2 * 2 + 1] = 1;
-    uvs[v3 * 2 + 0] = 0; uvs[v3 * 2 + 1] = 1;
+    uvs[v0 * 2 + 0] = 0;
+    uvs[v0 * 2 + 1] = 0;
+    uvs[v1 * 2 + 0] = 1;
+    uvs[v1 * 2 + 1] = 0;
+    uvs[v2 * 2 + 0] = 1;
+    uvs[v2 * 2 + 1] = 1;
+    uvs[v3 * 2 + 0] = 0;
+    uvs[v3 * 2 + 1] = 1;
 
     indices.push(v0, v2, v1);
     indices.push(v0, v3, v2);
@@ -368,123 +602,529 @@ function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depth
   return geom;
 }
 
-function buildShards() {
-  exploded = false;
-  crackLines.visible = true;
-  renderer.setClearColor(0x000000, 1);
+const GROW_FROM_EDGE_PROB = 0.5;
 
-  for (const m of shardMeshes) {
-    sceneRoot.remove(m);
-    m.geometry.dispose();
-    if (Array.isArray(m.material)) {
-      for (const mm of m.material) mm.dispose();
-    } else {
-      m.material.dispose();
+function createShardMesh(
+  polygon,
+  buildScrollY,
+  newDanglings = [],
+  inheritedDanglings = [],
+  clickPoint = null,
+  maxDist = 1,
+  parentPolygon = null,
+) {
+  // either use click point (default wave) or a random shard vertex as anchor
+  let anchor = clickPoint;
+  let anchorMax = maxDist;
+  if (clickPoint && Math.random() < GROW_FROM_EDGE_PROB && polygon.length > 0) {
+    anchor = polygon[Math.floor(Math.random() * polygon.length)];
+    let m = 1;
+    for (const v of polygon) {
+      m = Math.max(m, Math.hypot(v.x - anchor.x, v.y - anchor.y));
     }
+    anchorMax = m;
   }
-  shardMeshes = [];
-
-  if (cracks.length === 0) {
-    if (mesh) mesh.visible = true;
-    return;
-  }
+  const face = [...polygon].reverse();
+  if (face.length < 3) return null;
+  const indices = triangulateFace(face);
+  if (indices.length === 0) return null;
 
   const w = source.width;
   const h = source.height;
-  const sy = window.scrollY;
-  const contentH = page.offsetHeight;
-  shardBuildScrollY = sy;
 
-  const faces = computeFaces(cracks, w, contentH);
-  console.log(`[shatter] ${faces.length} faces from ${cracks.length} segments (contentH=${contentH})`);
+  let cxSum = 0,
+    cySum = 0;
+  const positions = new Float32Array(face.length * 3);
+  const uvs = new Float32Array(face.length * 2);
+  for (let i = 0; i < face.length; i++) {
+    positions[i * 3 + 0] = (face[i].x / w) * 2 - 1;
+    positions[i * 3 + 1] = 1 - ((face[i].y - buildScrollY) / h) * 2;
+    positions[i * 3 + 2] = 0;
+    uvs[i * 2 + 0] = face[i].x / w;
+    uvs[i * 2 + 1] = 1 - (face[i].y - buildScrollY) / h;
+    cxSum += positions[i * 3 + 0];
+    cySum += positions[i * 3 + 1];
+  }
+  const centroidX = cxSum / face.length;
+  const centroidY = cySum / face.length;
 
-  for (let fi = 0; fi < faces.length; fi++) {
-    const face = [...faces[fi]].reverse();
-    if (face.length < 3) continue;
-
-    const indices = triangulateFace(face);
-    if (indices.length === 0) continue;
-
-    let cxSum = 0, cySum = 0;
-    const positions = new Float32Array(face.length * 3);
-    const uvs = new Float32Array(face.length * 2);
-    for (let i = 0; i < face.length; i++) {
-      positions[i * 3 + 0] = (face[i].x / w) * 2 - 1;
-      positions[i * 3 + 1] = 1 - ((face[i].y - sy) / h) * 2;
-      positions[i * 3 + 2] = 0;
-      uvs[i * 2 + 0] = face[i].x / w;
-      uvs[i * 2 + 1] = 1 - (face[i].y - sy) / h;
-      cxSum += positions[i * 3 + 0];
-      cySum += positions[i * 3 + 1];
-    }
-    const centroidX = cxSum / face.length;
-    const centroidY = cySum / face.length;
-
-    for (let i = 0; i < face.length; i++) {
-      positions[i * 3 + 0] -= centroidX;
-      positions[i * 3 + 1] -= centroidY;
-    }
-
-    const depthNdc = 30 / h * 2;
-    const geom = buildExtrudedShardGeometry(positions, uvs, indices, depthNdc);
-
-    const hue = (fi * 137.5) % 360;
-    const c = new THREE.Color().setHSL(hue / 360, 1.0, 0.6);
-
-    const topMat = new THREE.MeshStandardNodeMaterial({
-      metalness: 0,
-      roughness: 0.1,
-    });
-    topMat.color = new THREE.Color(0, 0, 0);
-    const tex = texture(htmlTexture, uv());
-    topMat.emissiveNode = vec4(
-      tex.r.mul(0.95).add(c.r * 0.05),
-      tex.g.mul(0.95).add(c.g * 0.05),
-      tex.b.mul(0.95).add(c.b * 0.05),
-      1
-    );
-
-    const sideMat = new THREE.MeshStandardNodeMaterial({
-      metalness: 0,
-      roughness: 0.1,
-    });
-    sideMat.color = new THREE.Color(0, 0, 0);
-    sideMat.emissive = c;
-
-    const shardMesh = new THREE.Mesh(geom, [topMat, sideMat]);
-    shardMesh.frustumCulled = false;
-    shardMesh.renderOrder = 2;
-    shardMesh.userData.centroid = { x: centroidX, y: centroidY };
-    shardMesh.position.set(centroidX, centroidY, 0);
-    sceneRoot.add(shardMesh);
-    shardMeshes.push(shardMesh);
-
-    const maxAng = 0.5;
-    // shardMesh.rotation.x = MathUtils.randFloatSpread(maxAng);
-    // shardMesh.rotation.y = MathUtils.randFloatSpread(maxAng);
-
-    // gsap.to(shardMesh.rotation,{
-    //   x: MathUtils.randFloatSpread(maxAng),
-    //   y: MathUtils.randFloatSpread(maxAng),
-    //   duration: 0.1,
-    // })
+  for (let i = 0; i < face.length; i++) {
+    positions[i * 3 + 0] -= centroidX;
+    positions[i * 3 + 1] -= centroidY;
   }
 
-  if (mesh) mesh.visible = false;
+  const depthNdc = (30 / h) * 2;
+  const geom = buildExtrudedShardGeometry(positions, uvs, indices, depthNdc);
+
+  const HUE_MIX = 0; // set to 0.05 to re-enable per-shard tint
+  const hue = (shardHueCounter++ * 137.5) % 360;
+  const c = HUE_MIX > 0 ? new THREE.Color().setHSL(hue / 360, 1.0, 0.6) : new THREE.Color(0, 0, 0);
+
+  const opacityU = uniform(1);
+  const topMat = new THREE.MeshStandardNodeMaterial({
+    metalness: 0,
+    roughness: 0.1,
+    transparent: true,
+  });
+  topMat.color = new THREE.Color(0, 0, 0);
+  topMat.opacityNode = opacityU;
+  const tex = texture(htmlTexture, uv());
+  const texKeep = 1 - HUE_MIX;
+  topMat.emissiveNode = vec4(
+    tex.r.mul(texKeep).add(c.r * HUE_MIX),
+    tex.g.mul(texKeep).add(c.g * HUE_MIX),
+    tex.b.mul(texKeep).add(c.b * HUE_MIX),
+    1,
+  );
+
+  const sideMat = new THREE.MeshStandardNodeMaterial({
+    metalness: 0,
+    roughness: 0.1,
+    transparent: true,
+  });
+  sideMat.color = new THREE.Color(0, 0, 0);
+  sideMat.opacityNode = opacityU;
+  const sideBaseR = pageBgColor.r * texKeep + c.r * HUE_MIX;
+  const sideBaseG = pageBgColor.g * texKeep + c.g * HUE_MIX;
+  const sideBaseB = pageBgColor.b * texKeep + c.b * HUE_MIX;
+  sideMat.emissiveNode = vec4(
+    float(sideBaseR).add(rimR),
+    float(sideBaseG).add(rimG),
+    float(sideBaseB).add(rimB),
+    1,
+  );
+
+  const shardMesh = new THREE.Mesh(geom, [topMat, sideMat]);
+  shardMesh.frustumCulled = false;
+  shardMesh.renderOrder = 2;
+  shardMesh.userData.polygon = polygon;
+  shardMesh.userData.centroid = { x: centroidX, y: centroidY };
+  shardMesh.userData.buildScrollY = buildScrollY;
+  shardMesh.userData.dangleSegs = [...newDanglings, ...inheritedDanglings];
+  shardMesh.userData.opacityU = opacityU;
+  shardMesh.position.set(centroidX, centroidY, 0);
+
+  const lineChild = buildCrackLineChild(
+    polygon,
+    newDanglings,
+    inheritedDanglings,
+    centroidX,
+    centroidY,
+    buildScrollY,
+    anchor,
+    anchorMax,
+    parentPolygon,
+  );
+  if (lineChild) {
+    shardMesh.add(lineChild);
+    shardMesh.userData.lineProgress = lineChild.userData.progress;
+  }
+
+  return shardMesh;
+}
+
+function initializeRootShard() {
+  const w = source.width;
+  const h = source.height;
+  rootRect = { x0: 0, y0: 0, x1: w, y1: h };
+  const polygon = [
+    { x: 0, y: 0 },
+    { x: w, y: 0 },
+    { x: w, y: h },
+    { x: 0, y: h },
+  ];
+  const m = createShardMesh(polygon, 0);
+  if (m) {
+    sceneRoot.add(m);
+    shardMeshes.push(m);
+  }
+}
+
+function hitShard(x, y) {
+  const p = { x, y };
+  for (const m of shardMeshes) {
+    if (pointInPolygon(p, m.userData.polygon)) return m;
+  }
+  return null;
+}
+
+function disposeShardResources(m) {
+  m.geometry.dispose();
+  if (Array.isArray(m.material)) {
+    for (const mm of m.material) mm.dispose();
+  } else {
+    m.material.dispose();
+  }
+  for (const child of m.children) {
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose();
+  }
+}
+
+function removeShard(m) {
+  const idx = shardMeshes.indexOf(m);
+  if (idx >= 0) shardMeshes.splice(idx, 1);
+  sceneRoot.remove(m);
+  disposeShardResources(m);
+}
+
+function isInteriorPolygon(polygon, rect) {
+  const tol = 1.0;
+  for (const v of polygon) {
+    if (Math.abs(v.x - rect.x0) < tol) return false;
+    if (Math.abs(v.x - rect.x1) < tol) return false;
+    if (Math.abs(v.y - rect.y0) < tol) return false;
+    if (Math.abs(v.y - rect.y1) < tol) return false;
+  }
+  return true;
+}
+
+function distPointToSegment(p, a, b) {
+  const dx = b.x - a.x,
+    dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  if (len2 < 1e-10) return Math.hypot(p.x - a.x, p.y - a.y);
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+function isEdgeOnViewportRect(a, b, rect) {
+  const tol = 1.0;
+  if (Math.abs(a.y - rect.y0) < tol && Math.abs(b.y - rect.y0) < tol) return true;
+  if (Math.abs(a.y - rect.y1) < tol && Math.abs(b.y - rect.y1) < tol) return true;
+  if (Math.abs(a.x - rect.x0) < tol && Math.abs(b.x - rect.x0) < tol) return true;
+  if (Math.abs(a.x - rect.x1) < tol && Math.abs(b.x - rect.x1) < tol) return true;
+  return false;
+}
+
+function polygonArea(poly) {
+  let a = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const p = poly[i];
+    const q = poly[(i + 1) % poly.length];
+    a += p.x * q.y - q.x * p.y;
+  }
+  return Math.abs(a * 0.5);
+}
+
+function isEdgeOnPolygon(a, b, polygon, tol) {
+  for (let i = 0; i < polygon.length; i++) {
+    const pa = polygon[i];
+    const pb = polygon[(i + 1) % polygon.length];
+    if (distPointToSegment(a, pa, pb) < tol && distPointToSegment(b, pa, pb) < tol) return true;
+  }
+  return false;
+}
+
+const BOUNDARY_LINE_WIDTH = 4; // pixels
+const DANGLING_BASE_WIDTH = 4; // pixels (depth 0)
+const DANGLING_DEPTH_FALLOFF = 0.8; // width *= this^depth
+
+function widthForDepth(depth) {
+  return DANGLING_BASE_WIDTH * Math.pow(DANGLING_DEPTH_FALLOFF, depth);
+}
+
+function buildCrackLineChild(
+  polygon,
+  newDanglings,
+  inheritedDanglings,
+  centroidX,
+  centroidY,
+  buildScrollY,
+  clickPoint,
+  maxDist,
+  parentPolygon,
+) {
+  const w = source.width;
+  const h = source.height;
+  const rect = rootRect;
+  const tol = 1.0;
+
+  const positions = [];
+  const delays = [];
+  const indices = [];
+  let vi = 0;
+
+  function toNdcLocal(px, py) {
+    return [(px / w) * 2 - 1 - centroidX, 1 - ((py - buildScrollY) / h) * 2 - centroidY];
+  }
+
+  function delayFor(px, py) {
+    if (!clickPoint || !maxDist) return 0;
+    return Math.min(1, Math.hypot(px - clickPoint.x, py - clickPoint.y) / maxDist);
+  }
+
+  function addSeg(x0, y0, x1, y1, w0, w1, isNew) {
+    const pxDx = x1 - x0;
+    const pxDy = y1 - y0;
+    const pxLen = Math.hypot(pxDx, pxDy);
+    if (pxLen < 1e-6) return;
+    const pxNormX = -pxDy / pxLen;
+    const pxNormY = pxDx / pxLen;
+    const hw0 = w0 / 2,
+      hw1 = w1 / 2;
+
+    const [v0x, v0y] = toNdcLocal(x0 + pxNormX * hw0, y0 + pxNormY * hw0);
+    const [v1x, v1y] = toNdcLocal(x0 - pxNormX * hw0, y0 - pxNormY * hw0);
+    const [v2x, v2y] = toNdcLocal(x1 + pxNormX * hw1, y1 + pxNormY * hw1);
+    const [v3x, v3y] = toNdcLocal(x1 - pxNormX * hw1, y1 - pxNormY * hw1);
+
+    positions.push(v0x, v0y, 0);
+    positions.push(v1x, v1y, 0);
+    positions.push(v2x, v2y, 0);
+    positions.push(v3x, v3y, 0);
+
+    const d0 = isNew ? delayFor(x0, y0) : -1;
+    const d1 = isNew ? delayFor(x1, y1) : -1;
+    delays.push(d0, d0, d1, d1);
+
+    indices.push(vi, vi + 1, vi + 2);
+    indices.push(vi + 2, vi + 1, vi + 3);
+    vi += 4;
+  }
+
+  // polygon boundary edges
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i];
+    const b = polygon[(i + 1) % polygon.length];
+    if (rect && isEdgeOnViewportRect(a, b, rect)) continue;
+    // edge is "new" if NOT on the parent's polygon boundary (i.e., it's a fresh crack cut)
+    const isNew = parentPolygon ? !isEdgeOnPolygon(a, b, parentPolygon, tol) : true;
+    addSeg(a.x, a.y, b.x, b.y, BOUNDARY_LINE_WIDTH, BOUNDARY_LINE_WIDTH, isNew);
+  }
+
+  // new dangling segs (from this click)
+  for (const seg of newDanglings) {
+    const [x0, y0, x1, y1, , w0 = DANGLING_BASE_WIDTH, w1 = DANGLING_BASE_WIDTH] = seg;
+    addSeg(x0, y0, x1, y1, w0, w1, true);
+  }
+
+  // inherited dangling segs (pre-existing hair from parent)
+  for (const seg of inheritedDanglings) {
+    const [x0, y0, x1, y1, , w0 = DANGLING_BASE_WIDTH, w1 = DANGLING_BASE_WIDTH] = seg;
+    addSeg(x0, y0, x1, y1, w0, w1, false);
+  }
+
+  if (positions.length === 0) return null;
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+  geom.setAttribute('growDelay', new THREE.BufferAttribute(new Float32Array(delays), 1));
+  geom.setIndex(indices);
+
+  const progressNode = uniform(clickPoint ? 0 : 1);
+  const delayAttr = attribute('growDelay', 'float');
+
+  const mat = new THREE.MeshBasicNodeMaterial({
+    transparent: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+  });
+  // gate: 1 when progress >= delay, else 0; then scale by opacity
+  const alpha = progressNode.sub(delayAttr).mul(1000).clamp(0, 1).mul(crackOpacityU);
+  mat.colorNode = vec4(crackColorU, crackColorU, crackColorU, alpha);
+
+  const lineMesh = new THREE.Mesh(geom, mat);
+  lineMesh.frustumCulled = false;
+  lineMesh.position.z = 0.001;
+  lineMesh.renderOrder = 3;
+  lineMesh.userData.progress = progressNode;
+  return lineMesh;
+}
+
+function dropShard(m, delay = 0) {
+  sceneRoot.add(m);
+  const dx = MathUtils.randFloatSpread(0.4);
+  const dy = -4.0 - Math.random() * 3.0;
+  const dz = -40 - Math.random() * 30;
+  const duration = DROP_DURATION;
+  gsap.to(m.position, {
+    x: `+=${dx}`,
+    y: `+=${dy}`,
+    z: dz,
+    duration,
+    delay,
+    ease: 'power2.in',
+    onComplete: () => {
+      sceneRoot.remove(m);
+      disposeShardResources(m);
+    },
+  });
+  gsap.to(m.rotation, {
+    x: MathUtils.randFloatSpread(Math.PI * 2),
+    y: MathUtils.randFloatSpread(Math.PI * 2),
+    z: MathUtils.randFloatSpread(Math.PI),
+    duration,
+    delay,
+    ease: 'power1.in',
+  });
+  // Fade opacity over the last half of the drop so shards dissolve instead of pop.
+  const opacityU = m.userData.opacityU;
+  if (opacityU) {
+    const tracker = { v: 1 };
+    gsap.to(tracker, {
+      v: 0,
+      duration: duration * 0.3,
+      delay: delay + duration * 0.7,
+      ease: 'power1.in',
+      onUpdate() {
+        opacityU.value = tracker.v;
+      },
+    });
+  }
+}
+
+const GROW_DURATION = 0.6;
+const DROP_DURATION = 1.6;
+const DROP_START_DELAY = 0.1;
+const DROP_MAX_DELAY = 0.4;
+const EDGE_DROP_PROB = 0.2;
+const EDGE_DROP_MAX_AREA_FRAC = 0.15; // edge shard can only drop if polygon area < this * viewport area
+
+let droppedArea = 0;
+
+function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
+  const created = [];
+  if (!shardCracks || shardCracks.length === 0) return created;
+  if (shardMeshes.indexOf(shardMesh) === -1) return created;
+
+  const polygon = shardMesh.userData.polygon;
+  const buildScrollY = shardMesh.userData.buildScrollY;
+  const inherited = shardMesh.userData.dangleSegs || [];
+
+  const faces = computeFaces(shardCracks, polygon);
+  if (faces.length < 2) {
+    // Crack didn't split the shard (e.g. capped before reaching an edge).
+    // Rebuild the shard in place with the cracks added as dangling lines.
+    const addedDanglings = [];
+    for (const seg of shardCracks) {
+      const mid = { x: (seg[0] + seg[2]) / 2, y: (seg[1] + seg[3]) / 2 };
+      if (!pointInPolygon(mid, polygon)) continue;
+      let onEdge = false;
+      for (let i = 0; i < polygon.length; i++) {
+        const a = polygon[i];
+        const b = polygon[(i + 1) % polygon.length];
+        if (distPointToSegment(mid, a, b) < 1.0) {
+          onEdge = true;
+          break;
+        }
+      }
+      if (!onEdge) addedDanglings.push(seg);
+    }
+    if (addedDanglings.length === 0) return created;
+    removeShard(shardMesh);
+    const rebuilt = createShardMesh(
+      polygon,
+      buildScrollY,
+      addedDanglings,
+      inherited,
+      clickPoint,
+      maxDist,
+      polygon,
+    );
+    if (rebuilt) {
+      sceneRoot.add(rebuilt);
+      shardMeshes.push(rebuilt);
+      created.push(rebuilt);
+    }
+    return created;
+  }
+
+  removeShard(shardMesh);
+
+  const tol = 1.0;
+  const toDrop = [];
+  // Precompute midpoints once — reused for every face.
+  const shardMids = shardCracks.map((seg) => ({
+    x: (seg[0] + seg[2]) / 2,
+    y: (seg[1] + seg[3]) / 2,
+  }));
+  const inheritedMids = inherited.map((seg) => ({
+    x: (seg[0] + seg[2]) / 2,
+    y: (seg[1] + seg[3]) / 2,
+  }));
+  for (const face of faces) {
+    if (face.length < 3) continue;
+    // Face AABB for cheap PIP reject.
+    let fMinX = Infinity,
+      fMinY = Infinity,
+      fMaxX = -Infinity,
+      fMaxY = -Infinity;
+    for (const v of face) {
+      if (v.x < fMinX) fMinX = v.x;
+      if (v.x > fMaxX) fMaxX = v.x;
+      if (v.y < fMinY) fMinY = v.y;
+      if (v.y > fMaxY) fMaxY = v.y;
+    }
+    const newDanglings = [];
+    for (let k = 0; k < shardCracks.length; k++) {
+      const mid = shardMids[k];
+      if (mid.x < fMinX || mid.x > fMaxX || mid.y < fMinY || mid.y > fMaxY) continue;
+      if (!pointInPolygon(mid, face)) continue;
+      let onEdge = false;
+      for (let i = 0; i < face.length; i++) {
+        const a = face[i];
+        const b = face[(i + 1) % face.length];
+        if (distPointToSegment(mid, a, b) < tol) {
+          onEdge = true;
+          break;
+        }
+      }
+      if (!onEdge) newDanglings.push(shardCracks[k]);
+    }
+    const inheritedDanglings = [];
+    for (let k = 0; k < inherited.length; k++) {
+      const mid = inheritedMids[k];
+      if (mid.x < fMinX || mid.x > fMaxX || mid.y < fMinY || mid.y > fMaxY) continue;
+      if (pointInPolygon(mid, face)) inheritedDanglings.push(inherited[k]);
+    }
+    const newMesh = createShardMesh(
+      face,
+      buildScrollY,
+      newDanglings,
+      inheritedDanglings,
+      clickPoint,
+      maxDist,
+      polygon,
+    );
+    if (!newMesh) continue;
+    created.push(newMesh);
+
+    const interior = isInteriorPolygon(face, rootRect);
+
+    const smallEdge =
+      polygonArea(face) < source.width * source.height * EDGE_DROP_MAX_AREA_FRAC &&
+      Math.random() < EDGE_DROP_PROB;
+
+    if (interior || smallEdge) {
+      newMesh.rotation.x = MathUtils.randFloatSpread(0.1);
+      newMesh.rotation.y = MathUtils.randFloatSpread(0.1);
+
+      droppedArea += polygonArea(face);
+      toDrop.push(newMesh);
+    } else {
+      sceneRoot.add(newMesh);
+      shardMeshes.push(newMesh);
+    }
+  }
+  for (const m of toDrop) {
+    dropShard(m, DROP_START_DELAY + Math.random() * DROP_MAX_DELAY);
+  }
+  return created;
 }
 
 function explodeShards() {
   if (shardMeshes.length === 0) return;
   exploded = true;
   mesh.visible = false;
-  crackLines.visible = false;
   renderer.setClearColor(0x000000, 1);
 
   for (const m of shardMeshes) {
     const c = m.userData.centroid || { x: 0, y: 0 };
     const len = Math.hypot(c.x, c.y);
-    const dx = len > 0.01 ? c.x / len : (Math.random() - 0.5);
-    const dy = len > 0.01 ? c.y / len : (Math.random() - 0.5);
+    const dx = len > 0.01 ? c.x / len : MathUtils.randFloatSpread(1);
+    const dy = len > 0.01 ? c.y / len : MathUtils.randFloatSpread(1);
     const outDist = Math.random() * 0.08;
 
     const dur = 3 + Math.random() * 1.5;
@@ -499,9 +1139,9 @@ function explodeShards() {
       ease: 'power2.in',
     });
     gsap.to(m.rotation, {
-      x: (Math.random() - 0.5) * Math.PI,
-      y: (Math.random() - 0.5) * Math.PI,
-      z: (Math.random() - 0.5) * Math.PI * 0.6,
+      x: MathUtils.randFloatSpread(Math.PI),
+      y: MathUtils.randFloatSpread(Math.PI),
+      z: MathUtils.randFloatSpread(Math.PI * 0.6),
       duration: dur,
       delay,
       ease: 'power2.in',
@@ -512,7 +1152,6 @@ function explodeShards() {
 function resetShards() {
   if (shardMeshes.length === 0) return;
   exploded = false;
-  crackLines.visible = true;
   for (const m of shardMeshes) {
     gsap.killTweensOf(m.position);
     gsap.killTweensOf(m.rotation);
@@ -563,9 +1202,50 @@ function updateEnvIntensity() {
   scene.environmentIntensity = Math.min(maxMag * ENV_GAIN, 1);
 }
 
+const postProcessing = new THREE.RenderPipeline(renderer);
+const displayPass = pass(displayScene, decayCam);
+const bloomPass = bloom(displayPass, 0.38, 0.0, 0.0);
+// Composite shards over bloomed tunnel inside the outputNode so Three applies
+// the final tonemap/sRGB encode in one pass (matches tunnel-test's look).
+// RT sampling is Y-flipped for WebGPU.
+const bgNode = displayPass.add(bloomPass);
+const fgNode = texture(fgRT.texture, uv());
+postProcessing.outputNode = vec4(bgNode.rgb.mul(oneMinus(fgNode.a)).add(fgNode.rgb), 1);
+renderer.autoClear = false;
+
+let firstFrame = true;
 renderer.setAnimationLoop(() => {
   stats.update();
   if (controls.enabled) controls.update();
   updateEnvIntensity();
-  renderer.render(scene, camera);
+  if (tunnelApi) {
+    timer.update();
+    const dt = Math.min(timer.getDelta(), 0.05);
+    tunnelApi.update(dt);
+    // 1) decay + tunnel → feedbackRT (trail feedback intentional)
+    renderer.setRenderTarget(feedbackRT);
+    renderer.autoClear = false;
+    renderer.autoClearColor = false;
+    renderer.render(decayScene, decayCam);
+    renderer.render(tunnelScene, camera);
+    // 2) shards → fgRT with transparent bg
+    renderer.setRenderTarget(fgRT);
+    renderer.setClearColor(0x000000, 0);
+    renderer.autoClear = true;
+    renderer.autoClearColor = true;
+    renderer.autoClearDepth = true;
+    renderer.clear();
+    renderer.render(scene, camera);
+    renderer.setClearColor(0x000000, 1);
+    // 3) postProcessing outputNode composites bloom + fg → screen.
+    renderer.setRenderTarget(null);
+    postProcessing.render();
+  } else {
+    renderer.autoClear = true;
+    renderer.render(scene, camera);
+  }
+  if (firstFrame) {
+    firstFrame = false;
+    document.body.classList.add('ready');
+  }
 });

@@ -2,36 +2,57 @@ import earcut from 'earcut';
 
 const EPS = 0.5;
 
-export function computeFaces(segments, w, h) {
-  const allSegs = [
-    ...segments,
-    [0, 0, w, 0],
-    [w, 0, w, h],
-    [w, h, 0, h],
-    [0, h, 0, 0],
-  ];
+export function computeFaces(segments, boundaryPolygon) {
+  const boundarySegs = [];
+  const bn = boundaryPolygon.length;
+  for (let i = 0; i < bn; i++) {
+    const a = boundaryPolygon[i];
+    const b = boundaryPolygon[(i + 1) % bn];
+    boundarySegs.push([a.x, a.y, b.x, b.y]);
+  }
+  const allSegs = [...segments, ...boundarySegs];
 
-  const splits = allSegs.map(s => ({
-    ax: s[0], ay: s[1], bx: s[2], by: s[3],
-    ts: [0, 1],
-  }));
+  const splits = allSegs.map((s) => {
+    const ax = s[0],
+      ay = s[1],
+      bx = s[2],
+      by = s[3];
+    return {
+      ax,
+      ay,
+      bx,
+      by,
+      ts: [0, 1],
+      minX: ax < bx ? ax : bx,
+      maxX: ax > bx ? ax : bx,
+      minY: ay < by ? ay : by,
+      maxY: ay > by ? ay : by,
+    };
+  });
 
   for (let i = 0; i < splits.length; i++) {
+    const si = splits[i];
     for (let j = i + 1; j < splits.length; j++) {
-      const hit = segSeg(splits[i], splits[j]);
+      const sj = splits[j];
+      if (si.maxX < sj.minX || sj.maxX < si.minX || si.maxY < sj.minY || sj.maxY < si.minY) {
+        continue;
+      }
+      const hit = segSeg(si, sj);
       if (hit) {
-        splits[i].ts.push(hit.t);
-        splits[j].ts.push(hit.u);
+        si.ts.push(hit.t);
+        sj.ts.push(hit.u);
       }
     }
   }
 
   const subSegs = [];
   for (const s of splits) {
-    const unique = [...new Set(s.ts.map(t => Math.round(t * 1e8) / 1e8))].sort((a, b) => a - b);
-    const dx = s.bx - s.ax, dy = s.by - s.ay;
+    const unique = [...new Set(s.ts.map((t) => Math.round(t * 1e8) / 1e8))].sort((a, b) => a - b);
+    const dx = s.bx - s.ax,
+      dy = s.by - s.ay;
     for (let i = 0; i < unique.length - 1; i++) {
-      const t0 = unique[i], t1 = unique[i + 1];
+      const t0 = unique[i],
+        t1 = unique[i + 1];
       if (t1 - t0 < 1e-9) continue;
       const p0 = { x: s.ax + t0 * dx, y: s.ay + t0 * dy };
       const p1 = { x: s.ax + t1 * dx, y: s.ay + t1 * dy };
@@ -53,7 +74,8 @@ export function computeFaces(segments, w, h) {
 
   const edges = [];
   for (const [a, b] of subSegs) {
-    const va = addVert(a), vb = addVert(b);
+    const va = addVert(a),
+      vb = addVert(b);
     if (va !== vb) edges.push([va, vb]);
   }
 
@@ -103,9 +125,12 @@ export function computeFaces(segments, w, h) {
 
   for (let v = 0; v < verts.length; v++) {
     outgoing[v].sort((a, b) => {
-      const pa = verts[he[a].to], pb = verts[he[b].to];
-      return Math.atan2(pa.y - verts[v].y, pa.x - verts[v].x)
-           - Math.atan2(pb.y - verts[v].y, pb.x - verts[v].x);
+      const pa = verts[he[a].to],
+        pb = verts[he[b].to];
+      return (
+        Math.atan2(pa.y - verts[v].y, pa.x - verts[v].x) -
+        Math.atan2(pb.y - verts[v].y, pb.x - verts[v].x)
+      );
     });
   }
 
@@ -123,7 +148,8 @@ export function computeFaces(segments, w, h) {
   for (let i = 0; i < he.length; i++) {
     if (visited[i]) continue;
     const face = [];
-    let cur = i, safety = 0;
+    let cur = i,
+      safety = 0;
     do {
       if (safety++ > 50000) break;
       visited[cur] = 1;
@@ -132,7 +158,7 @@ export function computeFaces(segments, w, h) {
     } while (cur !== i && !visited[cur]);
 
     if (face.length >= 3) {
-      const poly = face.map(vi => verts[vi]);
+      const poly = face.map((vi) => verts[vi]);
       if (signedArea(poly) > 1) faces.push(poly);
     }
   }
@@ -146,12 +172,28 @@ export function triangulateFace(face) {
   return earcut(coords);
 }
 
+export function pointInPolygon(p, poly) {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x,
+      yi = poly[i].y;
+    const xj = poly[j].x,
+      yj = poly[j].y;
+    const intersect = yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 function segSeg(s1, s2) {
-  const dx1 = s1.bx - s1.ax, dy1 = s1.by - s1.ay;
-  const dx2 = s2.bx - s2.ax, dy2 = s2.by - s2.ay;
+  const dx1 = s1.bx - s1.ax,
+    dy1 = s1.by - s1.ay;
+  const dx2 = s2.bx - s2.ax,
+    dy2 = s2.by - s2.ay;
   const denom = dx1 * dy2 - dy1 * dx2;
   if (Math.abs(denom) < 1e-10) return null;
-  const acx = s2.ax - s1.ax, acy = s2.ay - s1.ay;
+  const acx = s2.ax - s1.ax,
+    acy = s2.ay - s1.ay;
   const t = (acx * dy2 - acy * dx2) / denom;
   const u = (acx * dy1 - acy * dx1) / denom;
   if (t < 1e-8 || t > 1 - 1e-8 || u < 1e-8 || u > 1 - 1e-8) return null;
