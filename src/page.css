@@ -83,14 +83,14 @@ body {
   display: block;
   overflow: hidden;
   z-index: 1;
-  visibility: hidden;
 }
 
 #stage {
-  position: absolute;
+  position: fixed;
   top: 0;
   left: 0;
   width: 100vw;
+  height: 100vh;
   display: block;
   pointer-events: none;
   z-index: 10;
@@ -208,7 +208,7 @@ body.ready #stage {
   border: 1px solid #30363d;
   border-radius: 4px;
   white-space: pre;
-  pointer-events: none;
+  user-select: text;
 }
 
 .gh-icon {

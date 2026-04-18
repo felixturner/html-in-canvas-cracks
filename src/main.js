@@ -165,7 +165,9 @@ function schedulePaint() {
   });
 }
 
+const devMode = new URLSearchParams(window.location.search).has('dev');
 const debug = document.getElementById('debug');
+if (!devMode) debug.style.display = 'none';
 
 function findShardAt(p, excludeShard) {
   for (const m of shardMeshes) {
@@ -282,7 +284,10 @@ function computeTipInfo(segs) {
   return { tips, keyFn };
 }
 
+let paintCount = 0;
+let lastPaintErr = '';
 function paint() {
+  paintCount++;
   try {
     ctx2d.clearRect(0, 0, window.innerWidth, window.innerHeight);
     ctx2d.drawElementImage(page, 0, 0);
@@ -292,21 +297,31 @@ function paint() {
       document.body.style.minHeight = contentH + 'px';
       lastContentH = contentH;
     }
+    const vh = window.innerHeight;
+    const docH = Math.max(vh, nativePage.offsetHeight);
+    const ratio = docH / vh;
+    sceneRoot.position.y = 1 - ratio + (2 * window.scrollY) / vh;
     updateShardScroll();
-    const mainInner = page.querySelector('.gh-main-inner');
-    debug.textContent =
-      `vp    ${window.innerWidth}x${window.innerHeight}  dpr ${window.devicePixelRatio}\n` +
-      `src   attr ${source.width}x${source.height}  css ${source.offsetWidth}x${source.offsetHeight}\n` +
-      `page  ${page.offsetWidth}x${page.offsetHeight}\n` +
-      `main  ${mainInner ? mainInner.offsetWidth : '-'}  split ${split.toFixed(2)}`;
   } catch (err) {
+    lastPaintErr = String(err && err.message ? err.message : err);
     schedulePaint();
   }
+  debug.textContent =
+    `vp    ${window.innerWidth}x${window.innerHeight}  dpr ${window.devicePixelRatio}\n` +
+    `src   attr ${source.width}x${source.height}  css h ${source.offsetHeight}\n` +
+    `clone ${page.offsetWidth}x${page.offsetHeight}\n` +
+    `live  ${nativePage.offsetWidth}x${nativePage.offsetHeight}\n` +
+    `scroll ${Math.round(window.scrollY)}/${document.body.scrollHeight - window.innerHeight}\n` +
+    `paint ${paintCount}  err ${lastPaintErr || '-'}`;
 }
 
-let split = 0.9;
-let htmlSplit = 0.95;
+let split = devMode ? 0.9 : 1.0;
+let htmlSplit = devMode ? 0.95 : 1.0;
 const dividerHtml = document.getElementById('divider-html');
+if (!devMode) {
+  divider.style.display = 'none';
+  dividerHtml.style.display = 'none';
+}
 
 function applySplit() {
   divider.style.left = split * 100 + 'vw';
@@ -319,24 +334,25 @@ function applySplit() {
 
 function resize() {
   const w = window.innerWidth;
-  const vh = window.innerHeight;
-  const fullH = Math.max(vh, document.documentElement.scrollHeight);
+  const h = window.innerHeight;
+  const docH = Math.max(h, nativePage.offsetHeight);
   const srcDpr = Math.min(window.devicePixelRatio, 2);
   source.width = Math.floor(w * srcDpr);
-  source.height = Math.floor(fullH * srcDpr);
+  source.height = Math.floor(docH * srcDpr);
   source.style.width = w + 'px';
-  source.style.height = fullH + 'px';
+  source.style.height = docH + 'px';
   createPipeline();
   renderer.setPixelRatio(srcDpr);
-  renderer.setSize(w, fullH, false);
-  const aspect = w / fullH;
+  renderer.setSize(w, h, false);
+  const aspect = w / h;
   camera.aspect = aspect;
   camera.updateProjectionMatrix();
-  sceneRoot.scale.set(aspect, 1, 1);
+  const ratio = docH / h;
+  sceneRoot.scale.set(aspect, ratio, 1);
   if (tunnelApi) tunnelApi.updateAspect(aspect);
   const dpr = Math.min(window.devicePixelRatio, 2);
   const rw = Math.max(1, Math.floor(w * dpr));
-  const rh = Math.max(1, Math.floor(fullH * dpr));
+  const rh = Math.max(1, Math.floor(h * dpr));
   feedbackRT.setSize(rw, rh);
   fgRT.setSize(rw, rh);
   applySplit();
@@ -461,6 +477,11 @@ window.addEventListener('click', (e) => {
   schedulePaint();
 });
 
+let shardMeshes = [];
+let exploded = false;
+let rootRect = null;
+let shardHueCounter = 0;
+
 resize();
 
 const stats = new Stats();
@@ -471,12 +492,8 @@ stats.dom.style.top = 'auto';
 stats.dom.style.right = 'auto';
 stats.dom.style.zIndex = '100';
 stats.dom.style.pointerEvents = 'none';
-document.body.appendChild(stats.dom);
+if (devMode) document.body.appendChild(stats.dom);
 
-let shardMeshes = [];
-let exploded = false;
-let rootRect = null;
-let shardHueCounter = 0;
 
 // Fresnel rim light — shared across all shard materials
 const rimStrengthU = uniform(0.8);
@@ -490,8 +507,7 @@ const pageBgColor = new THREE.Color(getComputedStyle(page).backgroundColor);
 const pageBgLum = pageBgColor.r * 0.299 + pageBgColor.g * 0.587 + pageBgColor.b * 0.114;
 
 function updateShardScroll() {
-  // stage canvas is full-doc absolute-positioned and scrolls with page,
-  // so shards don't need per-frame scroll compensation.
+  // sceneRoot scrolls via position.y, so shards don't need per-frame compensation.
 }
 
 function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depthNdc) {
