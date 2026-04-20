@@ -1,14 +1,17 @@
 import { MathUtils } from 'three';
 
+// Use Vite's BASE_URL so paths work under a subpath deploy (e.g. GitHub
+// Pages at /html-in-canvas-cracks/). BASE_URL always ends with a slash.
+const BASE = import.meta.env.BASE_URL;
 const CRACK_FILES = [
-  '/sfx/crk1.mp3',
-  '/sfx/crk2.mp3',
-  '/sfx/crk3.mp3',
-  '/sfx/crk4.mp3',
-  '/sfx/crk5.mp3',
-  '/sfx/crk6.mp3',
-  '/sfx/crk7.mp3',
-  '/sfx/crk8.mp3',
+  `${BASE}sfx/crk1.mp3`,
+  `${BASE}sfx/crk2.mp3`,
+  `${BASE}sfx/crk3.mp3`,
+  `${BASE}sfx/crk4.mp3`,
+  `${BASE}sfx/crk5.mp3`,
+  `${BASE}sfx/crk6.mp3`,
+  `${BASE}sfx/crk7.mp3`,
+  `${BASE}sfx/crk8.mp3`,
 ];
 
 const PITCH_BASE = 1.0;
@@ -42,7 +45,7 @@ let gammaStarted = false;
 async function loadGamma() {
   // wait until ctx exists (created in load())
   while (!ctx) await new Promise((r) => setTimeout(r, 50));
-  const res = await fetch('/sfx/gamma.mp3');
+  const res = await fetch(`${BASE}sfx/gamma.mp3`);
   const arr = await res.arrayBuffer();
   gammaBuffer = await ctx.decodeAudioData(arr);
 }

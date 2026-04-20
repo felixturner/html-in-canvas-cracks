@@ -255,7 +255,7 @@ const pmrem = new THREE.PMREMGenerator(renderer);
 pmrem.compileEquirectangularShader();
 scene.environmentIntensity = 0;
 
-new HDRLoader().load('/studio_kominka_01_1k.hdr', (hdr) => {
+new HDRLoader().load(`${import.meta.env.BASE_URL}studio_kominka_01_1k.hdr`, (hdr) => {
   hdr.mapping = THREE.EquirectangularReflectionMapping;
   scene.environment = pmrem.fromEquirectangular(hdr).texture;
   hdr.dispose();
