@@ -13,9 +13,12 @@ import {
   positionView,
   normalView,
   oneMinus,
+  saturate,
+  mix,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import Stats from 'three/addons/libs/stats.module.js';
+import GUI from 'three/addons/libs/lil-gui.module.min.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { MathUtils } from 'three';
@@ -38,14 +41,27 @@ if (typeof ctx2d.drawElementImage !== 'function') {
   warning.hidden = false;
   source.style.display = 'none';
   stage.style.display = 'none';
-  throw new Error('drawElementImage not available — enable chrome://flags/#canvas-draw-element');
+  throw new Error(
+    'drawElementImage not available — enable chrome://flags/#canvas-draw-element',
+  );
 }
 
 const scene = new THREE.Scene();
 const FOV = 60;
 const camera = new THREE.PerspectiveCamera(FOV, 1, 0.01, 200);
-camera.position.set(0, 0, 1 / Math.tan(((FOV / 2) * Math.PI) / 180));
-camera.lookAt(0, 0, 0);
+// Position camera so the 2×2 page plane exactly fills the vertical viewport
+// at the current FOV. Re-applied whenever FOV changes so the page stays
+// framed.
+function reframeCamera() {
+  camera.position.set(
+    0,
+    0,
+    1 / Math.tan(((camera.fov / 2) * Math.PI) / 180),
+  );
+  camera.lookAt(0, 0, 0);
+  camera.updateProjectionMatrix();
+}
+reframeCamera();
 
 scene.fog = new THREE.Fog(0x000000, 8, 60);
 
@@ -55,6 +71,16 @@ scene.add(sceneRoot);
 const timer = new THREE.Timer();
 const tunnelScene = new THREE.Scene();
 let tunnelApi = null;
+
+// Normalized mouse position in screen space, range -1..1. Drives a subtle
+// parallax tilt on the tunnel group.
+const mouseNorm = { x: 0, y: 0 };
+const TUNNEL_TILT_MAX = 0.15; // radians
+const TUNNEL_TILT_LERP = 4.0; // higher = snappier
+window.addEventListener('pointermove', (e) => {
+  mouseNorm.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouseNorm.y = (e.clientY / window.innerHeight) * 2 - 1;
+});
 
 // Feedback/decay setup — render tunnel to this RT each frame, with a decay
 // quad that fades the prior frame for trailing effect.
@@ -69,6 +95,14 @@ const rtOpts = {
 const feedbackRT = new THREE.RenderTarget(1, 1, rtOpts);
 // foreground RT for shards — needs depth buffer, alpha-cleared each frame
 const fgRT = new THREE.RenderTarget(1, 1, {
+  type: THREE.HalfFloatType,
+  magFilter: THREE.LinearFilter,
+  minFilter: THREE.LinearFilter,
+  colorSpace: THREE.LinearSRGBColorSpace,
+});
+// foreground RT for crack lines only — composited unshifted on top of the
+// CA'd shards so the line graphics stay crisp.
+const fgLinesRT = new THREE.RenderTarget(1, 1, {
   type: THREE.HalfFloatType,
   magFilter: THREE.LinearFilter,
   minFilter: THREE.LinearFilter,
@@ -89,6 +123,87 @@ decayMat.colorNode = vec4(float(0), float(0), float(0), decayAlphaU);
 const decayQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), decayMat);
 decayQuad.frustumCulled = false;
 decayScene.add(decayQuad);
+
+// --- Chromatic aberration driven by crack mask ---
+// The crack-line children (see buildCrackLineChild) are placed on MASK_LAYER
+// as well as the default layer. Each frame we render the scene with only
+// MASK_LAYER enabled into a low-res maskRT, and sampled in the composite to
+// drive a horizontal RGB split whose amount scales with proximity to a crack.
+const MASK_LAYER = 1;
+// Crack line meshes live on LINE_LAYER so they can be rendered into a
+// separate RT (fgLinesRT) and composited AFTER chromatic aberration — the
+// cracks themselves should be crisp, only the html behind them splits.
+const LINE_LAYER = 2;
+const MASK_DIV = 4; // 1/4-res mask; upsample already gives a soft halo.
+const maskRTOpts = {
+  type: THREE.HalfFloatType,
+  magFilter: THREE.LinearFilter,
+  minFilter: THREE.LinearFilter,
+  colorSpace: THREE.LinearSRGBColorSpace,
+  depthBuffer: false,
+  stencilBuffer: false,
+};
+const maskRT = new THREE.RenderTarget(1, 1, maskRTOpts);
+const maskBlurRT = new THREE.RenderTarget(1, 1, maskRTOpts);
+const maskTexel = uniform(new THREE.Vector2(1, 1)); // 1/maskSize in uv.
+
+// Blur scene: 9-tap gaussian over maskRT at low res → maskBlurRT.
+const blurScene = new THREE.Scene();
+const blurMat = new THREE.MeshBasicNodeMaterial({
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+});
+{
+  const t = maskTexel;
+  const u = vec2(uv().x, oneMinus(uv().y));
+  const w = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+  const offs = [
+    [-1, -1],
+    [0, -1],
+    [1, -1],
+    [-1, 0],
+    [0, 0],
+    [1, 0],
+    [-1, 1],
+    [0, 1],
+    [1, 1],
+  ];
+  let sum = null;
+  for (let i = 0; i < 9; i++) {
+    const off = vec2(t.x.mul(offs[i][0] * 2), t.y.mul(offs[i][1] * 2));
+    const s = texture(maskRT.texture, u.add(off)).mul(w[i]);
+    sum = sum ? sum.add(s) : s;
+  }
+  blurMat.colorNode = sum.mul(1 / 16);
+}
+const blurQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), blurMat);
+blurQuad.frustumCulled = false;
+blurScene.add(blurQuad);
+
+// CA controls (wired to GUI below).
+const caDistanceU = uniform(5.0); // mask gain — wider influence = higher value
+const caMaxOffsetU = uniform(0.012); // max R/B split, in uv units (~0.01 = 1%)
+const caShowMaskU = uniform(0.0); // 1 = override output with mask visualization
+// Fat-soft-brush mask controls (see buildCrackMaskChild).
+const MASK_BRUSH_WIDTH_PX = 300; // baked max strip width; thickness scales within
+const maskThicknessU = uniform(0.2); // 0..1 fraction of baked width that fades to 0
+const maskIntensityU = uniform(1.0); // overall alpha multiplier
+
+// Helper: sample `tex` at `uvN` with a radial RGB split whose strength is
+// scaled by the blurred crack mask at `uvN`.
+function caSample(tex, uvN) {
+  const mask = saturate(texture(maskBlurRT.texture, uvN).r.mul(caDistanceU));
+  // Simple fixed horizontal offset: R shifted right, B shifted left,
+  // amount scaled by proximity to a crack.
+  const amount = mask.mul(caMaxOffsetU);
+  const offset = vec2(amount, float(0));
+  const r = texture(tex, uvN.add(offset)).r;
+  const g = texture(tex, uvN).g;
+  const b = texture(tex, uvN.sub(offset)).b;
+  const a = texture(tex, uvN).a;
+  return vec4(r, g, b, a);
+}
 
 // display scene: fullscreen quad sampling feedbackRT, fed into bloom pass.
 const displayScene = new THREE.Scene();
@@ -186,7 +301,16 @@ function addSegToShard(map, shardMesh, seg) {
   arr.push(seg);
 }
 
-function walkBranch(x, y, angle, startShard, segsByShard, allSegs, steps, depth) {
+function walkBranch(
+  x,
+  y,
+  angle,
+  startShard,
+  segsByShard,
+  allSegs,
+  steps,
+  depth,
+) {
   if (depth > 3) return;
   let cx = x,
     cy = y,
@@ -289,17 +413,31 @@ let lastPaintErr = '';
 function paint() {
   paintCount++;
   try {
-    ctx2d.clearRect(0, 0, window.innerWidth, window.innerHeight);
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    // Use the clone `page` we actually draw — on fast horizontal resizes its
+    // reflowed height can differ briefly from nativePage, which produces a
+    // stretched texture if we use nativePage as the source of truth.
+    const contentH = Math.max(vh, page.offsetHeight, nativePage.offsetHeight);
+    const srcDpr = Math.min(window.devicePixelRatio, 2);
+    const targetPxW = Math.floor(vw * srcDpr);
+    const targetPxH = Math.floor(contentH * srcDpr);
+    if (source.width !== targetPxW || source.height !== targetPxH) {
+      source.width = targetPxW;
+      source.height = targetPxH;
+      source.style.width = vw + 'px';
+      source.style.height = contentH + 'px';
+    }
+    ctx2d.clearRect(0, 0, source.width, source.height);
     ctx2d.drawElementImage(page, 0, 0);
     htmlTexture.needsUpdate = true;
-    const contentH = page.offsetHeight;
     if (contentH > 0 && contentH !== lastContentH) {
       document.body.style.minHeight = contentH + 'px';
       lastContentH = contentH;
     }
-    const vh = window.innerHeight;
-    const docH = Math.max(vh, nativePage.offsetHeight);
-    const ratio = docH / vh;
+    const aspect = vw / vh;
+    const ratio = contentH / vh;
+    sceneRoot.scale.set(aspect, ratio, 1);
     sceneRoot.position.y = 1 - ratio + (2 * window.scrollY) / vh;
     updateShardScroll();
   } catch (err) {
@@ -335,26 +473,30 @@ function applySplit() {
 function resize() {
   const w = window.innerWidth;
   const h = window.innerHeight;
-  const docH = Math.max(h, nativePage.offsetHeight);
   const srcDpr = Math.min(window.devicePixelRatio, 2);
-  source.width = Math.floor(w * srcDpr);
-  source.height = Math.floor(docH * srcDpr);
+  // paint() owns the source canvas pixel buffer + sceneRoot.scale so the
+  // texture stays consistent with what's actually drawn this frame. We only
+  // set the canvas CSS width here so the clone `page` can reflow synchronously
+  // before paint() measures it.
   source.style.width = w + 'px';
-  source.style.height = docH + 'px';
   createPipeline();
   renderer.setPixelRatio(srcDpr);
   renderer.setSize(w, h, false);
   const aspect = w / h;
   camera.aspect = aspect;
   camera.updateProjectionMatrix();
-  const ratio = docH / h;
-  sceneRoot.scale.set(aspect, ratio, 1);
   if (tunnelApi) tunnelApi.updateAspect(aspect);
   const dpr = Math.min(window.devicePixelRatio, 2);
   const rw = Math.max(1, Math.floor(w * dpr));
   const rh = Math.max(1, Math.floor(h * dpr));
   feedbackRT.setSize(rw, rh);
   fgRT.setSize(rw, rh);
+  fgLinesRT.setSize(rw, rh);
+  const mw = Math.max(1, Math.floor(rw / MASK_DIV));
+  const mh = Math.max(1, Math.floor(rh / MASK_DIV));
+  maskRT.setSize(mw, mh);
+  maskBlurRT.setSize(mw, mh);
+  maskTexel.value.set(1 / mw, 1 / mh);
   applySplit();
   paint();
 }
@@ -408,9 +550,13 @@ themeToggleHit.addEventListener('click', (e) => {
   themeToggle.click();
 });
 themeToggle.addEventListener('click', () => {
-  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const isLight =
+    document.documentElement.getAttribute('data-theme') === 'light';
   const nextLight = !isLight;
-  document.documentElement.setAttribute('data-theme', nextLight ? 'light' : 'dark');
+  document.documentElement.setAttribute(
+    'data-theme',
+    nextLight ? 'light' : 'dark',
+  );
   themeToggle.textContent = nextLight ? '☀' : '☾';
   crackColorU.value = nextLight ? 0.0 : 1.0;
   crackOpacityU.value = nextLight ? 0.2 : 0.1;
@@ -462,15 +608,18 @@ window.addEventListener('click', (e) => {
   setGammaVolume(Math.min(1, frac));
   for (const m of newMeshes) {
     const prog = m.userData.lineProgress;
-    if (!prog) continue;
-    prog.value = 0;
+    const maskProg = m.userData.maskProgress;
+    if (!prog && !maskProg) continue;
+    if (prog) prog.value = 0;
+    if (maskProg) maskProg.value = 0;
     const tracker = { v: 0 };
     gsap.to(tracker, {
       v: 1,
       duration: GROW_DURATION,
       ease: 'power2.out',
       onUpdate() {
-        prog.value = tracker.v;
+        if (prog) prog.value = tracker.v;
+        if (maskProg) maskProg.value = tracker.v;
       },
     });
   }
@@ -494,23 +643,36 @@ stats.dom.style.zIndex = '100';
 stats.dom.style.pointerEvents = 'none';
 if (devMode) document.body.appendChild(stats.dom);
 
-
-// Fresnel rim light — shared across all shard materials
+// Fresnel rim light — shared across all shard materials. Both color and
+// strength are live-tunable via the GUI (see Shard Edges folder below).
 const rimStrengthU = uniform(0.8);
-const RIM_COLOR = new THREE.Color(0, 1, 0.4);
-const rimFactor = oneMinus(normalView.dot(positionView.normalize().negate()).abs()).pow(3);
-const rimR = float(RIM_COLOR.r).mul(rimFactor).mul(rimStrengthU);
-const rimG = float(RIM_COLOR.g).mul(rimFactor).mul(rimStrengthU);
-const rimB = float(RIM_COLOR.b).mul(rimFactor).mul(rimStrengthU);
+const rimColorU = uniform(new THREE.Color(0, 1, 0.4));
+// Separate multiplier applied only to side (edge) faces — lets the edges
+// glow brighter than the top.
+const sideRimBoostU = uniform(3.0);
+// Flat emissive boost on side faces (independent of fresnel).
+const sideEmissiveU = uniform(1.0);
+const rimFactor = oneMinus(
+  normalView.dot(positionView.normalize().negate()).abs(),
+).pow(3);
+const rimR = rimColorU.r.mul(rimFactor).mul(rimStrengthU);
+const rimG = rimColorU.g.mul(rimFactor).mul(rimStrengthU);
+const rimB = rimColorU.b.mul(rimFactor).mul(rimStrengthU);
 
 const pageBgColor = new THREE.Color(getComputedStyle(page).backgroundColor);
-const pageBgLum = pageBgColor.r * 0.299 + pageBgColor.g * 0.587 + pageBgColor.b * 0.114;
+const pageBgLum =
+  pageBgColor.r * 0.299 + pageBgColor.g * 0.587 + pageBgColor.b * 0.114;
 
 function updateShardScroll() {
   // sceneRoot scrolls via position.y, so shards don't need per-frame compensation.
 }
 
-function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depthNdc) {
+function buildExtrudedShardGeometry(
+  flatPositions,
+  flatUvs,
+  topTriIndices,
+  depthNdc,
+) {
   const n = flatPositions.length / 3;
   const topZ = 0;
   const botZ = -depthNdc;
@@ -547,7 +709,11 @@ function buildExtrudedShardGeometry(flatPositions, flatUvs, topTriIndices, depth
 
   // top triangles (reversed winding so +Z face is front-facing correctly)
   for (let i = 0; i < topTriIndices.length; i += 3) {
-    indices.push(topTriIndices[i + 0], topTriIndices[i + 2], topTriIndices[i + 1]);
+    indices.push(
+      topTriIndices[i + 0],
+      topTriIndices[i + 2],
+      topTriIndices[i + 1],
+    );
   }
   // bottom triangles (direct, offset by n)
   for (let i = 0; i < topTriIndices.length; i++) {
@@ -674,7 +840,10 @@ function createShardMesh(
 
   const HUE_MIX = 0; // set to 0.05 to re-enable per-shard tint
   const hue = (shardHueCounter++ * 137.5) % 360;
-  const c = HUE_MIX > 0 ? new THREE.Color().setHSL(hue / 360, 1.0, 0.6) : new THREE.Color(0, 0, 0);
+  const c =
+    HUE_MIX > 0
+      ? new THREE.Color().setHSL(hue / 360, 1.0, 0.6)
+      : new THREE.Color(0, 0, 0);
 
   const opacityU = uniform(1);
   const topMat = new THREE.MeshStandardNodeMaterial({
@@ -704,9 +873,9 @@ function createShardMesh(
   const sideBaseG = pageBgColor.g * texKeep + c.g * HUE_MIX;
   const sideBaseB = pageBgColor.b * texKeep + c.b * HUE_MIX;
   sideMat.emissiveNode = vec4(
-    float(sideBaseR).add(rimR),
-    float(sideBaseG).add(rimG),
-    float(sideBaseB).add(rimB),
+    float(sideBaseR).mul(sideEmissiveU).add(rimR.mul(sideRimBoostU)),
+    float(sideBaseG).mul(sideEmissiveU).add(rimG.mul(sideRimBoostU)),
+    float(sideBaseB).mul(sideEmissiveU).add(rimB.mul(sideRimBoostU)),
     1,
   );
 
@@ -734,6 +903,21 @@ function createShardMesh(
   if (lineChild) {
     shardMesh.add(lineChild);
     shardMesh.userData.lineProgress = lineChild.userData.progress;
+  }
+  const maskChild = buildCrackMaskChild(
+    polygon,
+    newDanglings,
+    inheritedDanglings,
+    centroidX,
+    centroidY,
+    buildScrollY,
+    anchor,
+    anchorMax,
+    parentPolygon,
+  );
+  if (maskChild) {
+    shardMesh.add(maskChild);
+    shardMesh.userData.maskProgress = maskChild.userData.progress;
   }
 
   return shardMesh;
@@ -807,10 +991,14 @@ function distPointToSegment(p, a, b) {
 
 function isEdgeOnViewportRect(a, b, rect) {
   const tol = 1.0;
-  if (Math.abs(a.y - rect.y0) < tol && Math.abs(b.y - rect.y0) < tol) return true;
-  if (Math.abs(a.y - rect.y1) < tol && Math.abs(b.y - rect.y1) < tol) return true;
-  if (Math.abs(a.x - rect.x0) < tol && Math.abs(b.x - rect.x0) < tol) return true;
-  if (Math.abs(a.x - rect.x1) < tol && Math.abs(b.x - rect.x1) < tol) return true;
+  if (Math.abs(a.y - rect.y0) < tol && Math.abs(b.y - rect.y0) < tol)
+    return true;
+  if (Math.abs(a.y - rect.y1) < tol && Math.abs(b.y - rect.y1) < tol)
+    return true;
+  if (Math.abs(a.x - rect.x0) < tol && Math.abs(b.x - rect.x0) < tol)
+    return true;
+  if (Math.abs(a.x - rect.x1) < tol && Math.abs(b.x - rect.x1) < tol)
+    return true;
   return false;
 }
 
@@ -828,7 +1016,11 @@ function isEdgeOnPolygon(a, b, polygon, tol) {
   for (let i = 0; i < polygon.length; i++) {
     const pa = polygon[i];
     const pb = polygon[(i + 1) % polygon.length];
-    if (distPointToSegment(a, pa, pb) < tol && distPointToSegment(b, pa, pb) < tol) return true;
+    if (
+      distPointToSegment(a, pa, pb) < tol &&
+      distPointToSegment(b, pa, pb) < tol
+    )
+      return true;
   }
   return false;
 }
@@ -863,12 +1055,18 @@ function buildCrackLineChild(
   let vi = 0;
 
   function toNdcLocal(px, py) {
-    return [(px / w) * 2 - 1 - centroidX, 1 - ((py - buildScrollY) / h) * 2 - centroidY];
+    return [
+      (px / w) * 2 - 1 - centroidX,
+      1 - ((py - buildScrollY) / h) * 2 - centroidY,
+    ];
   }
 
   function delayFor(px, py) {
     if (!clickPoint || !maxDist) return 0;
-    return Math.min(1, Math.hypot(px - clickPoint.x, py - clickPoint.y) / maxDist);
+    return Math.min(
+      1,
+      Math.hypot(px - clickPoint.x, py - clickPoint.y) / maxDist,
+    );
   }
 
   function addSeg(x0, y0, x1, y1, w0, w1, isNew) {
@@ -906,27 +1104,51 @@ function buildCrackLineChild(
     const b = polygon[(i + 1) % polygon.length];
     if (rect && isEdgeOnViewportRect(a, b, rect)) continue;
     // edge is "new" if NOT on the parent's polygon boundary (i.e., it's a fresh crack cut)
-    const isNew = parentPolygon ? !isEdgeOnPolygon(a, b, parentPolygon, tol) : true;
+    const isNew = parentPolygon
+      ? !isEdgeOnPolygon(a, b, parentPolygon, tol)
+      : true;
     addSeg(a.x, a.y, b.x, b.y, BOUNDARY_LINE_WIDTH, BOUNDARY_LINE_WIDTH, isNew);
   }
 
   // new dangling segs (from this click)
   for (const seg of newDanglings) {
-    const [x0, y0, x1, y1, , w0 = DANGLING_BASE_WIDTH, w1 = DANGLING_BASE_WIDTH] = seg;
+    const [
+      x0,
+      y0,
+      x1,
+      y1,
+      ,
+      w0 = DANGLING_BASE_WIDTH,
+      w1 = DANGLING_BASE_WIDTH,
+    ] = seg;
     addSeg(x0, y0, x1, y1, w0, w1, true);
   }
 
   // inherited dangling segs (pre-existing hair from parent)
   for (const seg of inheritedDanglings) {
-    const [x0, y0, x1, y1, , w0 = DANGLING_BASE_WIDTH, w1 = DANGLING_BASE_WIDTH] = seg;
+    const [
+      x0,
+      y0,
+      x1,
+      y1,
+      ,
+      w0 = DANGLING_BASE_WIDTH,
+      w1 = DANGLING_BASE_WIDTH,
+    ] = seg;
     addSeg(x0, y0, x1, y1, w0, w1, false);
   }
 
   if (positions.length === 0) return null;
 
   const geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
-  geom.setAttribute('growDelay', new THREE.BufferAttribute(new Float32Array(delays), 1));
+  geom.setAttribute(
+    'position',
+    new THREE.BufferAttribute(new Float32Array(positions), 3),
+  );
+  geom.setAttribute(
+    'growDelay',
+    new THREE.BufferAttribute(new Float32Array(delays), 1),
+  );
   geom.setIndex(indices);
 
   const progressNode = uniform(clickPoint ? 0 : 1);
@@ -938,7 +1160,11 @@ function buildCrackLineChild(
     side: THREE.DoubleSide,
   });
   // gate: 1 when progress >= delay, else 0; then scale by opacity
-  const alpha = progressNode.sub(delayAttr).mul(1000).clamp(0, 1).mul(crackOpacityU);
+  const alpha = progressNode
+    .sub(delayAttr)
+    .mul(1000)
+    .clamp(0, 1)
+    .mul(crackOpacityU);
   mat.colorNode = vec4(crackColorU, crackColorU, crackColorU, alpha);
 
   const lineMesh = new THREE.Mesh(geom, mat);
@@ -946,14 +1172,158 @@ function buildCrackLineChild(
   lineMesh.position.z = 0.001;
   lineMesh.renderOrder = 3;
   lineMesh.userData.progress = progressNode;
+  // Render crack lines only in the dedicated lines pass (no CA applied there).
+  lineMesh.layers.disable(0);
+  lineMesh.layers.enable(LINE_LAYER);
   return lineMesh;
+}
+
+// Fat soft-brush crack geometry used exclusively by the CA mask pass.
+// Same segment walk as buildCrackLineChild but with a much wider extrusion and
+// a perpT attribute (-1..+1 across the strip) used by the mask material for
+// soft falloff. Mesh lives only on MASK_LAYER so it is invisible in the main
+// render, and only shows up when rendering to maskRT.
+function buildCrackMaskChild(
+  polygon,
+  newDanglings,
+  inheritedDanglings,
+  centroidX,
+  centroidY,
+  buildScrollY,
+  clickPoint,
+  maxDist,
+  parentPolygon,
+) {
+  const w = source.width;
+  const h = source.height;
+  const rect = rootRect;
+  const tol = 1.0;
+  const BRUSH = MASK_BRUSH_WIDTH_PX;
+
+  const positions = [];
+  const perpTs = [];
+  const delays = [];
+  const indices = [];
+  let vi = 0;
+
+  function toNdcLocal(px, py) {
+    return [
+      (px / w) * 2 - 1 - centroidX,
+      1 - ((py - buildScrollY) / h) * 2 - centroidY,
+    ];
+  }
+
+  function delayFor(px, py) {
+    if (!clickPoint || !maxDist) return 0;
+    return Math.min(
+      1,
+      Math.hypot(px - clickPoint.x, py - clickPoint.y) / maxDist,
+    );
+  }
+
+  function addSeg(x0, y0, x1, y1, isNew) {
+    const pxDx = x1 - x0;
+    const pxDy = y1 - y0;
+    const pxLen = Math.hypot(pxDx, pxDy);
+    if (pxLen < 1e-6) return;
+    const pxNormX = -pxDy / pxLen;
+    const pxNormY = pxDx / pxLen;
+    const hw = BRUSH / 2;
+
+    const [v0x, v0y] = toNdcLocal(x0 + pxNormX * hw, y0 + pxNormY * hw);
+    const [v1x, v1y] = toNdcLocal(x0 - pxNormX * hw, y0 - pxNormY * hw);
+    const [v2x, v2y] = toNdcLocal(x1 + pxNormX * hw, y1 + pxNormY * hw);
+    const [v3x, v3y] = toNdcLocal(x1 - pxNormX * hw, y1 - pxNormY * hw);
+
+    positions.push(v0x, v0y, 0);
+    positions.push(v1x, v1y, 0);
+    positions.push(v2x, v2y, 0);
+    positions.push(v3x, v3y, 0);
+    // +1 on the +hw side, -1 on the -hw side.
+    perpTs.push(1, -1, 1, -1);
+
+    const d0 = isNew ? delayFor(x0, y0) : -1;
+    const d1 = isNew ? delayFor(x1, y1) : -1;
+    delays.push(d0, d0, d1, d1);
+
+    indices.push(vi, vi + 1, vi + 2);
+    indices.push(vi + 2, vi + 1, vi + 3);
+    vi += 4;
+  }
+
+  for (let i = 0; i < polygon.length; i++) {
+    const a = polygon[i];
+    const b = polygon[(i + 1) % polygon.length];
+    if (rect && isEdgeOnViewportRect(a, b, rect)) continue;
+    const isNew = parentPolygon
+      ? !isEdgeOnPolygon(a, b, parentPolygon, tol)
+      : true;
+    addSeg(a.x, a.y, b.x, b.y, isNew);
+  }
+  for (const seg of newDanglings) {
+    addSeg(seg[0], seg[1], seg[2], seg[3], true);
+  }
+  for (const seg of inheritedDanglings) {
+    addSeg(seg[0], seg[1], seg[2], seg[3], false);
+  }
+
+  if (positions.length === 0) return null;
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute(
+    'position',
+    new THREE.BufferAttribute(new Float32Array(positions), 3),
+  );
+  geom.setAttribute(
+    'perpT',
+    new THREE.BufferAttribute(new Float32Array(perpTs), 1),
+  );
+  geom.setAttribute(
+    'growDelay',
+    new THREE.BufferAttribute(new Float32Array(delays), 1),
+  );
+  geom.setIndex(indices);
+
+  const progressNode = uniform(clickPoint ? 0 : 1);
+  const delayAttr = attribute('growDelay', 'float');
+  const perpAttr = attribute('perpT', 'float');
+
+  const mat = new THREE.MeshBasicNodeMaterial({
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    side: THREE.DoubleSide,
+    toneMapped: false,
+  });
+  const grow = progressNode.sub(delayAttr).mul(1000).clamp(0, 1);
+  // Pure linear gradient across the strip: opacity = 1 at center, 0 at
+  // |perpT| = thickness. Anything beyond thickness is clamped to 0.
+  const widthProfile = saturate(
+    oneMinus(perpAttr.abs().div(maskThicknessU.max(float(0.001)))),
+  );
+  const alpha = widthProfile.mul(grow).mul(maskIntensityU);
+  mat.colorNode = vec4(float(1), float(1), float(1), alpha);
+
+  const maskMesh = new THREE.Mesh(geom, mat);
+  maskMesh.frustumCulled = false;
+  maskMesh.position.z = 0.001;
+  maskMesh.renderOrder = 3;
+  maskMesh.userData.progress = progressNode;
+  // Invisible in the main render: disable the default layer and enable only
+  // MASK_LAYER. Camera with layers.set(MASK_LAYER) picks it up in the mask pass.
+  maskMesh.layers.disable(0);
+  maskMesh.layers.enable(MASK_LAYER);
+  return maskMesh;
 }
 
 function dropShard(m, delay = 0) {
   sceneRoot.add(m);
   const dx = MathUtils.randFloatSpread(0.4);
-  const dy = -4.0 - Math.random() * 3.0;
-  const dz = -40 - Math.random() * 30;
+  const dy = -8.0 - Math.random() * 4.0;
+  // Drop well past scene.fog.far so the fog itself fades the shard out — no
+  // separate opacity tween needed. Camera sits at ~+1.7z so a final z of
+  // -80..-120 puts the shard 80..120 units from camera, clearly past fog.far.
+  const dz = -80 - Math.random() * 40;
   const duration = DROP_DURATION;
   gsap.to(m.position, {
     x: `+=${dx}`,
@@ -975,20 +1345,6 @@ function dropShard(m, delay = 0) {
     delay,
     ease: 'power1.in',
   });
-  // Fade opacity over the last half of the drop so shards dissolve instead of pop.
-  const opacityU = m.userData.opacityU;
-  if (opacityU) {
-    const tracker = { v: 1 };
-    gsap.to(tracker, {
-      v: 0,
-      duration: duration * 0.3,
-      delay: delay + duration * 0.7,
-      ease: 'power1.in',
-      onUpdate() {
-        opacityU.value = tracker.v;
-      },
-    });
-  }
 }
 
 const GROW_DURATION = 0.6;
@@ -1076,7 +1432,8 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
     const newDanglings = [];
     for (let k = 0; k < shardCracks.length; k++) {
       const mid = shardMids[k];
-      if (mid.x < fMinX || mid.x > fMaxX || mid.y < fMinY || mid.y > fMaxY) continue;
+      if (mid.x < fMinX || mid.x > fMaxX || mid.y < fMinY || mid.y > fMaxY)
+        continue;
       if (!pointInPolygon(mid, face)) continue;
       let onEdge = false;
       for (let i = 0; i < face.length; i++) {
@@ -1092,7 +1449,8 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
     const inheritedDanglings = [];
     for (let k = 0; k < inherited.length; k++) {
       const mid = inheritedMids[k];
-      if (mid.x < fMinX || mid.x > fMaxX || mid.y < fMinY || mid.y > fMaxY) continue;
+      if (mid.x < fMinX || mid.x > fMaxX || mid.y < fMinY || mid.y > fMaxY)
+        continue;
       if (pointInPolygon(mid, face)) inheritedDanglings.push(inherited[k]);
     }
     const newMesh = createShardMesh(
@@ -1104,13 +1462,22 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
       maxDist,
       polygon,
     );
-    if (!newMesh) continue;
+    if (!newMesh) {
+      // Root cause of #6 edge-shard "instant disappearance": a face from
+      // computeFaces passed the area>1px² gate but still failed createShardMesh
+      // (face<3 or earcut returned 0 indices). Since the parent shard has
+      // already been removed, that region is left blank — the user perceives
+      // the shard as vanishing instead of falling. Warn so we can spot it.
+      if (devMode) console.warn('shard face failed to mesh', face);
+      continue;
+    }
     created.push(newMesh);
 
     const interior = isInteriorPolygon(face, rootRect);
 
     const smallEdge =
-      polygonArea(face) < source.width * source.height * EDGE_DROP_MAX_AREA_FRAC &&
+      polygonArea(face) <
+        source.width * source.height * EDGE_DROP_MAX_AREA_FRAC &&
       Math.random() < EDGE_DROP_PROB;
 
     if (interior || smallEdge) {
@@ -1225,26 +1592,139 @@ const bloomPass = bloom(displayPass, 0.38, 0.0, 0.0);
 // the final tonemap/sRGB encode in one pass (matches tunnel-test's look).
 // RT sampling is Y-flipped for WebGPU.
 const bgNode = displayPass.add(bloomPass);
-const fgNode = texture(fgRT.texture, uv());
-postProcessing.outputNode = vec4(bgNode.rgb.mul(oneMinus(fgNode.a)).add(fgNode.rgb), 1);
+// Shards get CA; crack lines are sampled plainly and composited on top so
+// they stay crisp (no rgb split).
+const fgNode = caSample(fgRT.texture, uv());
+const fgLinesNode = texture(fgLinesRT.texture, uv());
+const afterShards = bgNode.rgb
+  .mul(oneMinus(fgNode.a))
+  .add(fgNode.rgb);
+const afterLines = afterShards
+  .mul(oneMinus(fgLinesNode.a))
+  .add(fgLinesNode.rgb);
+const composited = vec4(afterLines, 1);
+// Debug view: visualize the blurred crack mask (R channel * distance gain).
+const maskDebugVal = saturate(
+  texture(maskBlurRT.texture, uv()).r.mul(caDistanceU),
+);
+const maskDebug = vec4(vec3(maskDebugVal), 1);
+postProcessing.outputNode = mix(composited, maskDebug, caShowMaskU);
 renderer.autoClear = false;
+
+// GUI: chromatic aberration controls.
+const gui = new GUI({ title: 'FX' });
+// Camera.
+const camFolder = gui.addFolder('Camera');
+camFolder
+  .add({ v: camera.fov }, 'v', 20, 120, 1)
+  .name('FOV')
+  .onChange((v) => {
+    camera.fov = v;
+    reframeCamera();
+  });
+
+// Shard edges (green fresnel rim + side emissive).
+const edgeFolder = gui.addFolder('Shard Edges');
+edgeFolder
+  .add({ v: rimStrengthU.value }, 'v', 0, 5, 0.05)
+  .name('rim strength')
+  .onChange((v) => (rimStrengthU.value = v));
+edgeFolder
+  .add({ v: sideRimBoostU.value }, 'v', 0, 10, 0.1)
+  .name('side rim boost')
+  .onChange((v) => (sideRimBoostU.value = v));
+edgeFolder
+  .add({ v: sideEmissiveU.value }, 'v', 0, 4, 0.05)
+  .name('side emissive')
+  .onChange((v) => (sideEmissiveU.value = v));
+edgeFolder
+  .addColor(
+    {
+      c: `#${new THREE.Color(
+        rimColorU.value.r,
+        rimColorU.value.g,
+        rimColorU.value.b,
+      ).getHexString()}`,
+    },
+    'c',
+  )
+  .name('rim color')
+  .onChange((v) => rimColorU.value.set(v));
+
+const caFolder = gui.addFolder('Chromatic Aberration');
+caFolder
+  .add({ v: caDistanceU.value }, 'v', 0, 30, 0.1)
+  .name('distance')
+  .onChange((v) => (caDistanceU.value = v));
+caFolder
+  .add({ v: caMaxOffsetU.value }, 'v', 0, 0.1, 0.0005)
+  .name('max offset')
+  .onChange((v) => (caMaxOffsetU.value = v));
+caFolder
+  .add({ v: false }, 'v')
+  .name('show mask')
+  .onChange((v) => (caShowMaskU.value = v ? 1 : 0));
+// thickness is fractional (0..1) of the baked MASK_BRUSH_WIDTH_PX. Slider is
+// exposed in pixels for readability; converted to normalized on change.
+caFolder
+  .add(
+    { v: maskThicknessU.value * MASK_BRUSH_WIDTH_PX },
+    'v',
+    1,
+    MASK_BRUSH_WIDTH_PX,
+    1,
+  )
+  .name('mask thickness (px)')
+  .onChange((v) => (maskThicknessU.value = v / MASK_BRUSH_WIDTH_PX));
+caFolder
+  .add({ v: maskIntensityU.value }, 'v', 0, 4, 0.05)
+  .name('mask intensity')
+  .onChange((v) => (maskIntensityU.value = v));
+
+// macOS scroll bounce — window.scrollY is clamped to the content range so it
+// doesn't capture overscroll. Compare a top-anchored element's real on-screen
+// rect top against where it *should* be (offsetTop - scrollY); the diff is
+// the compositor bounce offset in CSS px. Poll each animation frame since
+// bounce doesn't fire scroll events.
+function applyScrollBounce() {
+  const vh = window.innerHeight;
+  if (vh === 0) return;
+  const expectedTop = nativePage.offsetTop - window.scrollY;
+  const actualTop = nativePage.getBoundingClientRect().top;
+  const bouncePx = actualTop - expectedTop;
+  if (Math.abs(bouncePx) < 0.5) return;
+  // Positive bouncePx = content pulled down (top overscroll). Subtract from
+  // scroll term so the 3D plane tracks the visual offset.
+  const docH = Math.max(vh, nativePage.offsetHeight);
+  const ratio = docH / vh;
+  sceneRoot.position.y = 1 - ratio + (2 * (window.scrollY - bouncePx)) / vh;
+}
 
 let firstFrame = true;
 renderer.setAnimationLoop(() => {
   stats.update();
   if (controls.enabled) controls.update();
+  applyScrollBounce();
   updateEnvIntensity();
   if (tunnelApi) {
     timer.update();
     const dt = Math.min(timer.getDelta(), 0.05);
     tunnelApi.update(dt);
+    // Mouse-parallax tilt: mouse X rotates tunnel around Y (opposite axis),
+    // mouse Y rotates around X. Signs negated so tunnel leans away from
+    // cursor. Lerped for smoothness.
+    const targetRotY = mouseNorm.x * TUNNEL_TILT_MAX;
+    const targetRotX = -mouseNorm.y * TUNNEL_TILT_MAX;
+    const k = 1 - Math.exp(-TUNNEL_TILT_LERP * dt);
+    tunnelApi.group.rotation.x += (targetRotX - tunnelApi.group.rotation.x) * k;
+    tunnelApi.group.rotation.y += (targetRotY - tunnelApi.group.rotation.y) * k;
     // 1) decay + tunnel → feedbackRT (trail feedback intentional)
     renderer.setRenderTarget(feedbackRT);
     renderer.autoClear = false;
     renderer.autoClearColor = false;
     renderer.render(decayScene, decayCam);
     renderer.render(tunnelScene, camera);
-    // 2) shards → fgRT with transparent bg
+    // 2) shards (html content, layer 0) → fgRT with transparent bg
     renderer.setRenderTarget(fgRT);
     renderer.setClearColor(0x000000, 0);
     renderer.autoClear = true;
@@ -1252,6 +1732,29 @@ renderer.setAnimationLoop(() => {
     renderer.autoClearDepth = true;
     renderer.clear();
     renderer.render(scene, camera);
+    // 2b) crack-line mask → maskRT (only MASK_LAYER visible), then blur.
+    const prevLayerMask = camera.layers.mask;
+    camera.layers.set(MASK_LAYER);
+    renderer.setRenderTarget(maskRT);
+    renderer.setClearColor(0x000000, 0);
+    renderer.autoClear = true;
+    renderer.autoClearColor = true;
+    renderer.autoClearDepth = true;
+    renderer.clear();
+    renderer.render(scene, camera);
+    // 2c) visible crack lines → fgLinesRT (composited unshifted, no CA).
+    camera.layers.set(LINE_LAYER);
+    renderer.setRenderTarget(fgLinesRT);
+    renderer.setClearColor(0x000000, 0);
+    renderer.autoClear = true;
+    renderer.autoClearColor = true;
+    renderer.autoClearDepth = true;
+    renderer.clear();
+    renderer.render(scene, camera);
+    camera.layers.mask = prevLayerMask;
+    renderer.setRenderTarget(maskBlurRT);
+    renderer.autoClear = true;
+    renderer.render(blurScene, decayCam);
     renderer.setClearColor(0x000000, 1);
     // 3) postProcessing outputNode composites bloom + fg → screen.
     renderer.setRenderTarget(null);

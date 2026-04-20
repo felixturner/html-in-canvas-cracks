@@ -36,13 +36,20 @@ function stripComments(src) {
 
 function splitIntoChunks(src) {
   const blocks = stripComments(src).split(/\n\s*\n+/);
+  const trimmedBlocks = blocks
+    .map((b) => b.replace(/^\n+|\n+$/g, ''))
+    .filter((b) => b.length > 0);
+
+  // Rejoin up to 3 consecutive blocks into each chunk (separated by a blank
+  // line) to produce taller code snippets.
+  const GROUP = 3;
   const out = [];
-  for (const b of blocks) {
-    const trimmed = b.replace(/^\n+|\n+$/g, '');
-    const lines = trimmed.split('\n');
+  for (let i = 0; i < trimmedBlocks.length; i += GROUP) {
+    const merged = trimmedBlocks.slice(i, i + GROUP).join('\n\n');
+    const lines = merged.split('\n');
     if (lines.length < 3 || lines.length > 45) continue;
-    if (trimmed.length < 40) continue;
-    out.push(trimmed);
+    if (merged.length < 40) continue;
+    out.push(merged);
   }
   return out;
 }
@@ -69,7 +76,10 @@ function makeCodeTexture(chunk) {
 
   const MAX_DIM = 2048;
   const MIN_DIM = 64;
-  const width = Math.max(MIN_DIM, Math.min(MAX_DIM, Math.ceil(maxTextW + padX * 2)));
+  const width = Math.max(
+    MIN_DIM,
+    Math.min(MAX_DIM, Math.ceil(maxTextW + padX * 2)),
+  );
   const height = Math.max(
     MIN_DIM,
     Math.min(MAX_DIM, Math.ceil(lines.length * lineHeight + padY * 2)),
@@ -184,7 +194,7 @@ function rectFrameGeometry(w, h, thickness) {
  */
 export function createTunnel(opts = {}) {
   const {
-    numCodePlanes = 300,
+    numCodePlanes = 200,
     numRects = 24,
     tunnelDepth = 38,
     spread = 7.5,
@@ -199,7 +209,9 @@ export function createTunnel(opts = {}) {
   const fogNear = 1.0;
   const fogFar = tunnelDepth * 0.9;
   const viewDist = positionView.z.negate();
-  const fogFactor = float(1.0).sub(smoothstep(float(fogNear), float(fogFar), viewDist));
+  const fogFactor = float(1.0).sub(
+    smoothstep(float(fogNear), float(fogFar), viewDist),
+  );
   const fogColor = vec3(0.0, 0.0, 0.0);
 
   const chunks = [
@@ -225,7 +237,7 @@ export function createTunnel(opts = {}) {
   // Inner radius of the code-plane spawn annulus (world units). Keeps a small
   // dead zone around the tunnel axis so planes don't pass through the camera
   // and blow out the center.
-  const DEAD_ZONE = 3.0;
+  const DEAD_ZONE = 1.0;
 
   // Live-tunable code opacity (multiplied into every code plane's colorNode).
   // DEBUG: defaulted to 0 so only the grid is visible while we tune.
@@ -266,7 +278,7 @@ export function createTunnel(opts = {}) {
     ).mul(codeOpacityU);
 
     // Plane sized to the chunk's natural text aspect so no stretching.
-    const planeH = (0.9 + Math.random() * 1.3) * 0.5;
+    const planeH = (0.9 + Math.random() * 1.3) * 1.0;
     const planeW = planeH * chunkAspect;
     const plane = new THREE.Mesh(new THREE.PlaneGeometry(planeW, planeH), mat);
     // Place planes in an elliptical annulus scaled by viewport aspect so
@@ -362,7 +374,20 @@ export function createTunnel(opts = {}) {
 
     function addRibbon(p0, p1, p2, p3, uvLen, scrolls) {
       const phase = Math.random();
-      positions.push(p0.x, p0.y, p0.z, p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+      positions.push(
+        p0.x,
+        p0.y,
+        p0.z,
+        p1.x,
+        p1.y,
+        p1.z,
+        p2.x,
+        p2.y,
+        p2.z,
+        p3.x,
+        p3.y,
+        p3.z,
+      );
       uvs.push(0, 0, 1, 0, 0, uvLen, 1, uvLen);
       phases.push(phase, phase, phase, phase);
       lineLens.push(uvLen, uvLen, uvLen, uvLen);
@@ -460,10 +485,19 @@ export function createTunnel(opts = {}) {
     }
 
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(new Float32Array(positions), 3),
+    );
     geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2));
-    geo.setAttribute('linePhase', new THREE.BufferAttribute(new Float32Array(phases), 1));
-    geo.setAttribute('lineLength', new THREE.BufferAttribute(new Float32Array(lineLens), 1));
+    geo.setAttribute(
+      'linePhase',
+      new THREE.BufferAttribute(new Float32Array(phases), 1),
+    );
+    geo.setAttribute(
+      'lineLength',
+      new THREE.BufferAttribute(new Float32Array(lineLens), 1),
+    );
     geo.setIndex(indices);
     return { geo, scrollEntries };
   }
@@ -521,9 +555,11 @@ export function createTunnel(opts = {}) {
     // without changing the overall rate of pulses.
     const nSharp = pow(n, pulseSharpU);
     const pulse = smoothstep(pulseCutoffU, float(1.0), nSharp);
-    const colorRgb = mix(fogColor, mix(gridDarkColor, gridBrightColor, pulse), fogFactor).mul(
-      gridOpacityU,
-    );
+    const colorRgb = mix(
+      fogColor,
+      mix(gridDarkColor, gridBrightColor, pulse),
+      fogFactor,
+    ).mul(gridOpacityU);
 
     const centerDist = crossPos.sub(0.5).abs().mul(2);
     const edgeFade = smoothstep(float(1.0), float(0.3), centerDist);

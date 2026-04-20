@@ -102,6 +102,21 @@ body.ready #stage {
   visibility: visible;
 }
 
+/* Black curtain that covers everything during init so the user doesn't see
+   the unframed source canvas flash or the first few empty render targets.
+   Removed once the first good frame is on screen. */
+#boot-curtain {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  z-index: 9999;
+  pointer-events: none;
+  transition: opacity 180ms ease-out;
+}
+body.ready #boot-curtain {
+  opacity: 0;
+}
+
 #divider,
 #divider-html {
   position: fixed;
@@ -709,6 +724,60 @@ body.ready #stage {
 .md-body strong {
   color: var(--fg);
   font-weight: 600;
+}
+.md-body ol {
+  padding-left: 2em;
+  margin: 0 0 16px;
+}
+
+/* GitHub-style markdown alert (WARNING/IMPORTANT/NOTE blockquotes) */
+.markdown-alert {
+  padding: 8px 16px;
+  margin-bottom: 16px;
+  border-left: 0.25em solid var(--alert-color, var(--border));
+  color: inherit;
+}
+.markdown-alert .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  color: var(--alert-color, var(--fg));
+  margin: 0 0 4px;
+}
+.markdown-alert .markdown-alert-title svg {
+  fill: currentColor;
+}
+.markdown-alert p {
+  margin: 4px 0;
+}
+.markdown-alert-warning {
+  --alert-color: #d29922;
+}
+html[data-theme='light'] .markdown-alert-warning {
+  --alert-color: #9a6700;
+}
+.md-alert-lg {
+  font-size: 16px;
+  line-height: 1.55;
+  padding: 12px 20px;
+}
+.md-alert-lg .markdown-alert-title {
+  font-size: 17px;
+}
+.md-alert-lg p {
+  margin: 6px 0;
+}
+.md-live-demo {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 16px 0;
+}
+.md-live-demo a {
+  text-decoration: none;
+}
+.md-live-demo a:hover {
+  text-decoration: underline;
 }
 
 /* sidebar */

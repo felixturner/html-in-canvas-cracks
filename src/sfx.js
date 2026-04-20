@@ -83,7 +83,8 @@ export function playCrack() {
   const buf = buffers[idx];
   const source = ctx.createBufferSource();
   source.buffer = buf;
-  source.playbackRate.value = PITCH_BASE + MathUtils.randFloatSpread(PITCH_SPREAD);
+  source.playbackRate.value =
+    PITCH_BASE + MathUtils.randFloatSpread(PITCH_SPREAD);
   const gain = ctx.createGain();
   gain.gain.value = VOL_BASE + MathUtils.randFloatSpread(VOL_SPREAD);
   source.connect(gain).connect(ctx.destination);

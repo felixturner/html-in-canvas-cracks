@@ -34,7 +34,12 @@ export function computeFaces(segments, boundaryPolygon) {
     const si = splits[i];
     for (let j = i + 1; j < splits.length; j++) {
       const sj = splits[j];
-      if (si.maxX < sj.minX || sj.maxX < si.minX || si.maxY < sj.minY || sj.maxY < si.minY) {
+      if (
+        si.maxX < sj.minX ||
+        sj.maxX < si.minX ||
+        si.maxY < sj.minY ||
+        sj.maxY < si.minY
+      ) {
         continue;
       }
       const hit = segSeg(si, sj);
@@ -47,7 +52,9 @@ export function computeFaces(segments, boundaryPolygon) {
 
   const subSegs = [];
   for (const s of splits) {
-    const unique = [...new Set(s.ts.map((t) => Math.round(t * 1e8) / 1e8))].sort((a, b) => a - b);
+    const unique = [
+      ...new Set(s.ts.map((t) => Math.round(t * 1e8) / 1e8)),
+    ].sort((a, b) => a - b);
     const dx = s.bx - s.ax,
       dy = s.by - s.ay;
     for (let i = 0; i < unique.length - 1; i++) {
@@ -169,7 +176,17 @@ export function computeFaces(segments, boundaryPolygon) {
 export function triangulateFace(face) {
   const coords = [];
   for (const v of face) coords.push(v.x, v.y);
-  return earcut(coords);
+  const tris = earcut(coords);
+  // earcut occasionally returns 0 indices for thin sliver polygons produced
+  // by crack propagation against the viewport rim — this previously dropped
+  // the face silently and the shard appeared to vanish instead of falling.
+  // Fan triangulation is a safe fallback; caller already guards face.length.
+  if (tris.length === 0 && face.length >= 3) {
+    const fan = [];
+    for (let i = 1; i < face.length - 1; i++) fan.push(0, i, i + 1);
+    return fan;
+  }
+  return tris;
 }
 
 export function pointInPolygon(p, poly) {
@@ -179,7 +196,8 @@ export function pointInPolygon(p, poly) {
       yi = poly[i].y;
     const xj = poly[j].x,
       yj = poly[j].y;
-    const intersect = yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi;
+    const intersect =
+      yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi;
     if (intersect) inside = !inside;
   }
   return inside;
