@@ -1,3 +1,15 @@
+html,
+body {
+  background: #000;
+}
+
+#native-page {
+  opacity: 0;
+}
+body.ready #native-page {
+  opacity: 1;
+}
+
 :root {
   --bg: #0d1117;
   --bg-elev: #161b22;
@@ -41,6 +53,12 @@ html[data-theme='light'] {
   justify-content: center;
   padding: 0;
 }
+#theme-toggle::before {
+  content: '☾';
+}
+[data-theme='light'] #theme-toggle::before {
+  content: '☀';
+}
 #theme-toggle-hit {
   position: fixed;
   z-index: 30;
@@ -83,10 +101,14 @@ body {
   display: block;
   overflow: hidden;
   z-index: 1;
+  visibility: hidden;
 }
 
 #stage {
-  position: fixed;
+  /* position:absolute (not fixed) so #stage rides the document compositor
+     layer and inherits macOS rubber-band bounce. JS keeps it visually locked
+     to the viewport by setting transform: translateY(scrollY) on scroll. */
+  position: absolute;
   top: 0;
   left: 0;
   width: 100vw;
@@ -94,27 +116,11 @@ body {
   display: block;
   pointer-events: none;
   z-index: 10;
-  visibility: hidden;
-}
-
-body.ready #source,
-body.ready #stage {
-  visibility: visible;
-}
-
-/* Black curtain that covers everything during init so the user doesn't see
-   the unframed source canvas flash or the first few empty render targets.
-   Removed once the first good frame is on screen. */
-#boot-curtain {
-  position: fixed;
-  inset: 0;
   background: #000;
-  z-index: 9999;
-  pointer-events: none;
-  transition: opacity 180ms ease-out;
 }
-body.ready #boot-curtain {
-  opacity: 0;
+
+body.ready #source {
+  visibility: visible;
 }
 
 #divider,
@@ -418,7 +424,8 @@ body.ready #boot-curtain {
   margin-left: 2px;
 }
 .gh-goto-file {
-  flex: 1;
+  flex: 1 1 180px;
+  min-width: 180px;
   max-width: 320px;
   background: var(--btn-bg);
   border: 1px solid var(--border);
@@ -533,17 +540,12 @@ body.ready #boot-curtain {
   padding: 0 24px;
 }
 
-@media (max-width: 900px) {
-  .gh-main-inner {
-    grid-template-columns: 1fr;
-  }
-}
-
 /* code header */
 .gh-code-header {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
   margin-bottom: 16px;
 }
 .gh-branch-btn,
@@ -929,4 +931,81 @@ html[data-theme='light'] .markdown-alert-warning {
     13px/1.4 ui-monospace,
     Menlo,
     monospace;
+}
+
+@media (max-width: 900px) {
+  .gh-topnav-inner {
+    padding: 0 16px;
+    gap: 8px;
+  }
+  .gh-topnav-search,
+  .gh-topnav-links {
+    display: none;
+  }
+  .gh-repo-inner {
+    padding: 16px 16px 0;
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .gh-repo-name {
+    flex-wrap: wrap;
+    font-size: 18px;
+  }
+  .gh-repo-actions {
+    flex-wrap: wrap;
+  }
+  .gh-repo-actions .gh-btn:first-child {
+    display: none;
+  }
+  .gh-tabs-wrap {
+    padding: 0 16px;
+  }
+  .gh-main-inner {
+    display: flex;
+    flex-direction: column;
+    padding: 0 16px;
+  }
+  .gh-sidebar {
+    order: -1;
+  }
+  .gh-sidebar-section {
+    padding: 0;
+    border-bottom: none;
+  }
+  .gh-sidebar-section ~ .gh-sidebar-section {
+    display: none;
+  }
+  .gh-sidebar-section h3 {
+    display: none;
+  }
+  .gh-sidebar-section > p:not(.gh-sidebar-link) {
+    display: none;
+  }
+  .gh-topics {
+    display: none;
+  }
+  .gh-sidebar-link {
+    margin: 0 0 12px;
+  }
+  .gh-sidebar-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border-muted);
+    margin-bottom: 16px;
+  }
+  .gh-file-meta {
+    display: none;
+  }
+  .gh-code-header {
+    flex-wrap: wrap;
+  }
+  .gh-code-btn {
+    margin-left: auto;
+  }
+  .gh-goto-file {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
 }

@@ -1,13 +1,6 @@
 ## TODO
 
-- rename repo html-in-canvas-cracks
-- make the gihub page longer - switch page content to actual repo
-- try different fovs
 - test on mobile
-- make edges brighter
-- fix sometimes edge pieces disapear
-- add back edges have refections geen light glow?
-- fix refelctions on tilt
 - check slow down /perf
 - add fallback?
 - resize without rebuilding the whole pipeline. options:

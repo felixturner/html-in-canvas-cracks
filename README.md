@@ -10,7 +10,7 @@ rather than the final display surface.
 > [`chrome://flags/#canvas-draw-element`](chrome://flags/#canvas-draw-element)
 > enabled.
 
-### [Live Demo →](#)
+### <ins>[Live Demo →](https://felixturner.github.io/html-in-canvas-cracks/)</ins>
 
 ## What It Is
 
@@ -123,10 +123,12 @@ a few subtleties.
   both re-synchronized inside `paint()` using the live cloned layout instead
   of a resize-time snapshot. This kills the aspect-stretch artifact that
   otherwise shows up when dragging the window narrower.
-- **Boot curtain.** A black full-screen overlay covers the page during
-  initialization and fades out once the first good frame is on screen — the
-  first paint of a WebGPU `postProcessing.render()` lags the DOM by a frame
-  or two, and the curtain hides that transition.
+- **Boot hand-off.** The screen mesh outputs opaque black until the HTML
+  texture has been painted at least once (`screenReadyU` uniform), so the
+  foreground RT has `alpha = 1` from frame zero and the tunnel can never
+  bleed through while the pipeline warms up. `body` flips to `ready` on the
+  first successful pipeline frame, which reveals `#source` and fades in the
+  native DOM layer underneath.
 
 ## Controls
 

@@ -26,7 +26,7 @@
             <a href="#">Issues</a>
             <a href="#">Marketplace</a>
             <a href="#">Explore</a>
-            <button id="theme-toggle" title="Toggle theme">☾</button>
+            <button id="theme-toggle" title="Toggle theme"></button>
           </nav>
           <div class="gh-topnav-actions">
             <span class="gh-icon-btn">+</span>
@@ -51,7 +51,7 @@
             </svg>
             <a href="#" class="gh-repo-owner">felixturner</a>
             <span class="gh-slash">/</span>
-            <a href="#" class="gh-repo-strong">html-in-canvas</a>
+            <a href="#" class="gh-repo-strong">html-in-canvas-cracks</a>
             <span class="gh-badge">Public</span>
           </h1>
           <div class="gh-repo-actions">
@@ -480,7 +480,7 @@
                 <span class="md-header-meta">MIT license</span>
               </div>
               <div class="md-body">
-                <h1>html-in-canvas</h1>
+                <h1>html-in-canvas-cracks</h1>
                 <p>
                   Real HTML, real layout, real scrolling — rendered through a
                   WebGPU pipeline with TSL shaders, feedback trails,
@@ -512,7 +512,7 @@
                   </p>
                 </div>
                 <p class="md-live-demo">
-                  This is the demo, please click around to see the effect.
+                  This is the demo, please click around to see the effect. 🙂
                 </p>
                 <h2>What It Is</h2>
                 <p>
@@ -692,12 +692,11 @@
                     instead of a resize-time snapshot.
                   </li>
                   <li>
-                    <strong>Boot curtain.</strong> A black full-screen
-                    overlay covers the page during initialization and fades
-                    out once the first good frame is on screen — the first
-                    paint of a WebGPU <code>postProcessing.render()</code>
-                    lags the DOM by a frame or two, and the curtain hides
-                    that transition.
+                    <strong>Boot hand-off.</strong> The screen mesh outputs
+                    opaque black until the HTML texture has been painted at
+                    least once, so the foreground RT has
+                    <code>alpha = 1</code> from frame zero and the tunnel
+                    can never bleed through while the pipeline warms up.
                   </li>
                 </ul>
                 <h2>Controls</h2>
@@ -743,11 +742,10 @@ npm run dev</code></pre>
               <h3>About</h3>
               <p>
                 Real HTML rendered through a WebGPU + TSL pipeline — DOM as a
-                texture source, with feedback trails, a code tunnel
-                background, and live post-processing.
+                texture source with live post-processing.
               </p>
               <p class="gh-sidebar-link">
-                🔗 felixturner.github.io/html-in-canvas
+                🔗 felixturner.github.io/html-in-canvas-cracks/
               </p>
               <div class="gh-topics">
                 <span class="gh-topic">webgpu</span>
@@ -931,8 +929,6 @@ npm run dev</code></pre>
       title="Toggle theme"
       aria-label="Toggle theme"
     ></button>
-
-    <div id="boot-curtain"></div>
 
     <div id="debug"></div>
 
