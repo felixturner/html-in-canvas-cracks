@@ -34,7 +34,7 @@ This project wires that pipeline up end-to-end:
 5. The page you see is the 3D composite — the DOM underneath is hidden, but
    still receives clicks, keyboard input, and text selection.
 
-[draw-element]: https://developer.chrome.com/blog/canvas-draw-element
+[draw-element]: https://developer.chrome.com/blog/canvas2d
 
 ## Rendering Pipeline
 
