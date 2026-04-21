@@ -1,14 +1,15 @@
 import * as THREE from 'three/webgpu';
 import {
   uv,
+  vec2,
   vec4,
-  vec3,
   texture,
   float,
   uniform,
   attribute,
   pass,
   oneMinus,
+  positionLocal,
   positionView,
   smoothstep,
 } from 'three/tsl';
@@ -66,6 +67,32 @@ const SHARD_FOG_FAR = 60;
 
 const sceneRoot = new THREE.Group();
 scene.add(sceneRoot);
+
+// Shards live in viewport-CSS-pixel space. Geometry is stored in CSS px with
+// origin at viewport top-left; shardRoot's transform (scale 2/vh, anchored
+// top-left) maps that to the camera frustum so shards pin to their original
+// VP pixel positions — cracks don't drift on scroll, content (sampled from
+// the reflowed source canvas) re-flows through them at natural CSS-px size.
+// Uniform scale keeps drop-tween rotations from shearing shards. Re-synced
+// on resize.
+const shardRoot = new THREE.Group();
+scene.add(shardRoot);
+
+function syncShardRoot() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const aspect = vw / vh;
+  shardRoot.position.set(-aspect, 1, 0);
+  const s = 2 / vh;
+  shardRoot.scale.set(s, -s, s);
+}
+
+// Shared uniforms for VP-locked shard shaders. Shards sample the HTML texture
+// using live viewport position + current scrollY so content behind them
+// re-flows as the page scrolls (shard = a fixed window onto the live DOM).
+const scrollYU = uniform(0);
+const sourceCssWU = uniform(window.innerWidth);
+const sourceCssHU = uniform(window.innerHeight);
 
 const timer = new THREE.Timer();
 const tunnelScene = new THREE.Scene();
@@ -134,6 +161,11 @@ waitForTunnelFont().then(() => {
 
 let htmlTexture = null;
 let mesh = null;
+// Sticky across resize(): once anything has cracked, createPipeline() must
+// keep the rebuilt base plane hidden. Otherwise a resize after the first
+// crack repaints a fresh full-screen HTML plane behind the shards, which
+// covers the tunnel that should be visible through dropped-shard holes.
+let hasCracked = false;
 // Screen mesh outputs opaque black until the html texture has been painted
 // at least once. Keeps fgRT alpha = 1 so the tunnel never bleeds through
 // during init.
@@ -145,18 +177,27 @@ function createPipeline() {
     mesh.geometry.dispose();
     mesh.material.dispose();
   }
-  if (htmlTexture) htmlTexture.dispose();
-
-  htmlTexture = new THREE.CanvasTexture(source);
-  htmlTexture.colorSpace = THREE.SRGBColorSpace;
-  htmlTexture.minFilter = THREE.LinearFilter;
-  htmlTexture.magFilter = THREE.LinearFilter;
+  // IMPORTANT: don't dispose/recreate htmlTexture on resize. Shard materials
+  // capture the current `htmlTexture` reference via TSL texture() at mesh
+  // build time — if we swap the global to a new CanvasTexture, the shards
+  // keep sampling the orphaned old one (whose GPU upload never refreshes
+  // because paint() only calls needsUpdate on the new one). Result: shards
+  // show the pre-resize canvas content squeezed into the new VP → looks
+  // horizontally squished. Allocate the texture once, wrap the source
+  // canvas, and let paint() flag needsUpdate every frame.
+  if (!htmlTexture) {
+    htmlTexture = new THREE.CanvasTexture(source);
+    htmlTexture.colorSpace = THREE.SRGBColorSpace;
+    htmlTexture.minFilter = THREE.LinearFilter;
+    htmlTexture.magFilter = THREE.LinearFilter;
+  }
 
   const material = new THREE.MeshBasicNodeMaterial();
   const tex = texture(htmlTexture, uv());
   material.colorNode = vec4(tex.rgb.mul(screenReadyU), 1);
 
   mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  if (hasCracked) mesh.visible = false;
   sceneRoot.add(mesh);
 }
 
@@ -357,7 +398,9 @@ function paint() {
     if (longest * srcDpr > maxTex) srcDpr = maxTex / longest;
     const targetPxW = Math.floor(vw * srcDpr);
     const targetPxH = Math.floor(contentH * srcDpr);
-    if (source.width !== targetPxW || source.height !== targetPxH) {
+    const bufferChanged =
+      source.width !== targetPxW || source.height !== targetPxH;
+    if (bufferChanged) {
       source.width = targetPxW;
       source.height = targetPxH;
       source.style.width = vw + 'px';
@@ -365,13 +408,25 @@ function paint() {
     }
     ctx2d.clearRect(0, 0, source.width, source.height);
     ctx2d.drawElementImage(page, 0, 0);
+    if (bufferChanged && htmlTexture) {
+      // WebGPU textures are fixed-size; re-uploading a different-sized canvas
+      // into the existing GPU allocation scales it to the old dimensions
+      // (shards sample a stretched / squished layout). Dispose to force the
+      // renderer to allocate a fresh GPUTexture matching the new canvas
+      // dimensions on the next render. The JS object is preserved so all the
+      // shard materials' TSL texture() refs keep sampling the correct node.
+      htmlTexture.dispose();
+    }
     htmlTexture.needsUpdate = true;
     screenReadyU.value = 1;
     if (contentH > 0 && contentH !== lastContentH) {
       document.body.style.minHeight = contentH + 'px';
       lastContentH = contentH;
     }
-    updateShardScroll();
+    // Feed live values into shard shaders so UV sampling tracks scroll/resize.
+    scrollYU.value = window.scrollY;
+    sourceCssWU.value = vw;
+    sourceCssHU.value = contentH;
     lastPaintErr = null;
   } catch (err) {
     lastPaintErr = String(err && err.message ? err.message : err);
@@ -406,24 +461,25 @@ function applySplit() {
 function resize() {
   const w = window.innerWidth;
   const h = window.innerHeight;
-  const srcDpr = Math.min(window.devicePixelRatio, 2);
+  const dpr = Math.min(window.devicePixelRatio, 2);
   // paint() owns the source canvas pixel buffer + sceneRoot.scale so the
   // texture stays consistent with what's actually drawn this frame. We only
   // set the canvas CSS width here so the clone `page` can reflow synchronously
   // before paint() measures it.
   source.style.width = w + 'px';
   createPipeline();
-  renderer.setPixelRatio(srcDpr);
+  renderer.setPixelRatio(dpr);
   renderer.setSize(w, h, false);
   const aspect = w / h;
   camera.aspect = aspect;
   camera.updateProjectionMatrix();
   if (tunnelApi) tunnelApi.updateAspect(aspect);
-  const dpr = Math.min(window.devicePixelRatio, 2);
   const rw = Math.max(1, Math.floor(w * dpr));
   const rh = Math.max(1, Math.floor(h * dpr));
   feedbackRT.setSize(rw, rh);
   fgRT.setSize(rw, rh);
+  syncShardRoot();
+  syncSpillShards();
   applySplit();
   paint();
 }
@@ -491,14 +547,6 @@ themeToggle.addEventListener('click', () => {
 window.addEventListener('resize', resize);
 window.addEventListener('scroll', schedulePaint, { passive: true });
 
-// #stage is position:absolute (on the document layer) so it inherits the
-// macOS rubber-band transform. Translate by scrollY so it visually stays
-// glued to the viewport like a position:fixed element would.
-function syncStageToScroll() {
-  stage.style.transform = `translateY(${window.scrollY}px)`;
-}
-syncStageToScroll();
-window.addEventListener('scroll', syncStageToScroll, { passive: true });
 new ResizeObserver(schedulePaint).observe(page);
 
 window.addEventListener('click', (e) => {
@@ -506,11 +554,13 @@ window.addEventListener('click', (e) => {
   if (e.target.closest('#divider')) return;
   if (e.target.closest('#divider-html')) return;
   if (e.target.closest('#theme-toggle')) return;
-  const dpr = Math.min(window.devicePixelRatio, 2);
-  const x = e.clientX * dpr;
-  const y = (e.clientY + window.scrollY) * dpr;
+  // VP-locked: coords are CSS viewport px (origin top-left of viewport).
+  // No DPR, no scrollY — shards pin to the viewport, not the document.
+  const x = e.clientX;
+  const y = e.clientY;
   if (shardMeshes.length === 0 && rootRect === null) {
     initializeRootShard();
+    hasCracked = true;
     if (mesh) mesh.visible = false;
   }
   const hit = hitShard(x, y);
@@ -538,7 +588,7 @@ window.addEventListener('click', (e) => {
     const created = fractureShardWithCracks(shard, segs, clickPoint, maxDist);
     newMeshes.push(...created);
   }
-  const screenArea = source.width * source.height;
+  const screenArea = window.innerWidth * window.innerHeight;
   const frac = screenArea > 0 ? droppedArea / screenArea : 0;
   setGammaVolume(Math.min(1, frac));
   for (const m of newMeshes) {
@@ -559,9 +609,14 @@ window.addEventListener('click', (e) => {
 });
 
 let shardMeshes = [];
-let exploded = false;
 let rootRect = null;
 let shardHueCounter = 0;
+// Single unfractured spill shard per growth direction. On further grow we
+// mutate its polygon (extend x1 / y1) instead of adding another shard so the
+// right/bottom strip doesn't fill with a stack of thin vertical rectangles.
+// Nulled once the user fractures it.
+let rightSpillShard = null;
+let bottomSpillShard = null;
 
 resize();
 
@@ -578,19 +633,16 @@ if (devMode) document.body.appendChild(stats.dom);
 // Flat green color for shard side (edge) faces. Live-tunable via GUI.
 const edgeColorU = uniform(new THREE.Color(0, 1, 0.4));
 
-function updateShardScroll() {
-  // sceneRoot scrolls via position.y, so shards don't need per-frame compensation.
-}
-
 function buildExtrudedShardGeometry(
   flatPositions,
   flatUvs,
   topTriIndices,
-  depthNdc,
+  depth,
+  skipSideEdge,
 ) {
   const n = flatPositions.length / 3;
   const topZ = 0;
-  const botZ = -depthNdc;
+  const botZ = -depth;
 
   const totalV = 2 * n + 4 * n;
   const positions = new Float32Array(totalV * 3);
@@ -684,8 +736,10 @@ function buildExtrudedShardGeometry(
     uvs[v3 * 2 + 0] = 0;
     uvs[v3 * 2 + 1] = 1;
 
-    indices.push(v0, v2, v1);
-    indices.push(v0, v3, v2);
+    if (!skipSideEdge || !skipSideEdge[i]) {
+      indices.push(v0, v2, v1);
+      indices.push(v0, v3, v2);
+    }
   }
   const sideCount = indices.length - topBotCount;
 
@@ -703,7 +757,6 @@ const GROW_FROM_EDGE_PROB = 0.5;
 
 function createShardMesh(
   polygon,
-  buildScrollY,
   newDanglings = [],
   inheritedDanglings = [],
   clickPoint = null,
@@ -726,32 +779,47 @@ function createShardMesh(
   const indices = triangulateFace(face);
   if (indices.length === 0) return null;
 
-  const w = source.width;
-  const h = source.height;
-
+  // Vertex positions are in VP CSS pixels, re-centered around the polygon
+  // centroid. UVs are computed live in the shader from positionLocal +
+  // centroidU + scrollYU so the HTML texture sample tracks scroll/resize.
   let cxSum = 0,
     cySum = 0;
   const positions = new Float32Array(face.length * 3);
   const uvs = new Float32Array(face.length * 2);
   for (let i = 0; i < face.length; i++) {
-    positions[i * 3 + 0] = (face[i].x / w) * 2 - 1;
-    positions[i * 3 + 1] = 1 - ((face[i].y - buildScrollY) / h) * 2;
-    positions[i * 3 + 2] = 0;
-    uvs[i * 2 + 0] = face[i].x / w;
-    uvs[i * 2 + 1] = 1 - (face[i].y - buildScrollY) / h;
-    cxSum += positions[i * 3 + 0];
-    cySum += positions[i * 3 + 1];
+    cxSum += face[i].x;
+    cySum += face[i].y;
   }
   const centroidX = cxSum / face.length;
   const centroidY = cySum / face.length;
-
   for (let i = 0; i < face.length; i++) {
-    positions[i * 3 + 0] -= centroidX;
-    positions[i * 3 + 1] -= centroidY;
+    positions[i * 3 + 0] = face[i].x - centroidX;
+    positions[i * 3 + 1] = face[i].y - centroidY;
+    positions[i * 3 + 2] = 0;
+    // Placeholder UVs — not used by the shader, but the attribute must exist.
+    uvs[i * 2 + 0] = 0;
+    uvs[i * 2 + 1] = 0;
   }
 
-  const depthNdc = (60 / h) * 2;
-  const geom = buildExtrudedShardGeometry(positions, uvs, indices, depthNdc);
+  // Depth in shardRoot local (CSS-px) units. shardRoot.scale.z = 2/vh, so
+  // 15 local units ≈ 0.03 world at vh=1000 — matches the previous depth.
+  const depthLocal = 15;
+  // Precompute which polygon edges sit on the root viewport rect so the
+  // extrusion can skip their side walls. Otherwise the first crack paints a
+  // green rim all the way around the viewport.
+  const skipSideEdge = new Array(face.length);
+  for (let i = 0; i < face.length; i++) {
+    const a = face[i];
+    const b = face[(i + 1) % face.length];
+    skipSideEdge[i] = rootRect ? isEdgeOnViewportRect(a, b, rootRect) : false;
+  }
+  const geom = buildExtrudedShardGeometry(
+    positions,
+    uvs,
+    indices,
+    depthLocal,
+    skipSideEdge,
+  );
 
   const HUE_MIX = 0; // set to 0.05 to re-enable per-shard tint
   const hue = (shardHueCounter++ * 137.5) % 360;
@@ -770,9 +838,31 @@ function createShardMesh(
   );
   const fogAlpha = opacityU.mul(fogFactor);
 
-  const topMat = new THREE.MeshBasicNodeMaterial({ transparent: true });
+  // Per-shard centroid in VP CSS px (tracks the mesh's position in shardRoot
+  // local space; positionLocal.xy + centroidU reconstructs the absolute VP
+  // px of this vertex, even if the mesh has been translated by drop tweens).
+  const centroidU = uniform(new THREE.Vector2(centroidX, centroidY));
+  // Live UV: vpPx = positionLocal.xy + centroid is absolute VP CSS px.
+  // UV.x = vpPx.x / sourceCssW. UV.y flips and offsets by scroll:
+  // docY = vpPx.y + scrollY ; UV.y = 1 - docY/sourceCssH.
+  const vpPx = positionLocal.xy.add(centroidU);
+  const docPxY = vpPx.y.add(scrollYU);
+  const uvLive = vec2(
+    vpPx.x.div(sourceCssWU),
+    float(1).sub(docPxY.div(sourceCssHU)),
+  );
+
+  // DoubleSide on shard faces: shardRoot has scale.y = -s (negative to flip
+  // the Y axis so VP-y-down maps to world-y-down), which mirrors triangle
+  // winding. With default FrontSide culling the shards would randomly show
+  // their back face or get culled depending on rotation state — DoubleSide
+  // sidesteps the whole winding question.
+  const topMat = new THREE.MeshBasicNodeMaterial({
+    transparent: true,
+    side: THREE.DoubleSide,
+  });
   topMat.opacityNode = fogAlpha;
-  const tex = texture(htmlTexture, uv());
+  const tex = texture(htmlTexture, uvLive);
   const texKeep = 1 - HUE_MIX;
   topMat.colorNode = vec4(
     tex.r.mul(texKeep).add(c.r * HUE_MIX),
@@ -781,7 +871,10 @@ function createShardMesh(
     1,
   );
 
-  const sideMat = new THREE.MeshBasicNodeMaterial({ transparent: true });
+  const sideMat = new THREE.MeshBasicNodeMaterial({
+    transparent: true,
+    side: THREE.DoubleSide,
+  });
   sideMat.opacityNode = fogAlpha;
   sideMat.colorNode = vec4(edgeColorU.r, edgeColorU.g, edgeColorU.b, 1);
 
@@ -790,9 +883,7 @@ function createShardMesh(
   shardMesh.renderOrder = 2;
   shardMesh.userData.polygon = polygon;
   shardMesh.userData.centroid = { x: centroidX, y: centroidY };
-  shardMesh.userData.buildScrollY = buildScrollY;
   shardMesh.userData.dangleSegs = [...newDanglings, ...inheritedDanglings];
-  shardMesh.userData.opacityU = opacityU;
   shardMesh.position.set(centroidX, centroidY, 0);
 
   const lineChild = buildCrackLineChild(
@@ -801,7 +892,6 @@ function createShardMesh(
     inheritedDanglings,
     centroidX,
     centroidY,
-    buildScrollY,
     anchor,
     anchorMax,
     parentPolygon,
@@ -815,19 +905,97 @@ function createShardMesh(
 }
 
 function initializeRootShard() {
-  const w = source.width;
-  const h = source.height;
-  rootRect = { x0: 0, y0: 0, x1: w, y1: h };
+  // Root shard polygon covers the full VP in CSS px. Un-cracked area ≡
+  // viewport — if the VP later widens, the extra area has no shard (tunnel
+  // will show through until a crack extends into it).
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  // Defensive: if vw/vh changed since last resize() but syncShardRoot hasn't
+  // fired, the shard would build in the wrong VP space. Re-sync now.
+  syncShardRoot();
+  rootRect = { x0: 0, y0: 0, x1: vw, y1: vh };
   const polygon = [
     { x: 0, y: 0 },
-    { x: w, y: 0 },
-    { x: w, y: h },
-    { x: 0, y: h },
+    { x: vw, y: 0 },
+    { x: vw, y: vh },
+    { x: 0, y: vh },
   ];
-  const m = createShardMesh(polygon, 0);
+  const m = createShardMesh(polygon);
   if (m) {
-    sceneRoot.add(m);
+    shardRoot.add(m);
     shardMeshes.push(m);
+  }
+}
+
+// After the first crack, `rootRect` is frozen at the VP size at crack time.
+// If the user resizes wider or taller, the newly-exposed rim would show the
+// tunnel through fgRT alpha=0. Instead of tiling the whole rim with strip
+// shards (which made a stack of thin vertical rectangles during a drag), we
+// place a single small spill shard per direction, anchored at the last click
+// point. Subsequent grows mutate that same shard's polygon to reach the new
+// VP edge — no new shards added. If the user fractures the spill shard, its
+// reference is cleared (see removeShard) and the next grow spawns a fresh
+// one at the then-current click point.
+function syncSpillShards() {
+  if (!rootRect) return;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const newX1 = Math.max(rootRect.x1, vw);
+  const newY1 = Math.max(rootRect.y1, vh);
+  if (newX1 === rootRect.x1 && newY1 === rootRect.y1) return;
+
+  // Grow rootRect BEFORE building shards so createShardMesh's
+  // isEdgeOnViewportRect check suppresses side walls on the new rim edges.
+  const oldX1 = rootRect.x1;
+  const oldY1 = rootRect.y1;
+  rootRect.x1 = newX1;
+  rootRect.y1 = newY1;
+
+  if (newX1 > oldX1) {
+    // Left edge stays pinned at the first grow's oldX1 (stored on the mesh)
+    // so subsequent grows just extend the same shard rightward.
+    const leftX = rightSpillShard
+      ? rightSpillShard.userData.spillLeftX
+      : oldX1;
+    const poly = [
+      { x: leftX, y: 0 },
+      { x: newX1, y: 0 },
+      { x: newX1, y: newY1 },
+      { x: leftX, y: newY1 },
+    ];
+    if (rightSpillShard) removeShard(rightSpillShard);
+    const m = createShardMesh(poly);
+    if (m) {
+      m.userData.spillLeftX = leftX;
+      shardRoot.add(m);
+      shardMeshes.push(m);
+      rightSpillShard = m;
+    }
+  }
+
+  if (newY1 > oldY1) {
+    const topY = bottomSpillShard
+      ? bottomSpillShard.userData.spillTopY
+      : oldY1;
+    // Bottom strip spans only the un-grown X range so it doesn't overlap the
+    // right-spill shard at the corner.
+    const rightX = rightSpillShard
+      ? rightSpillShard.userData.spillLeftX
+      : newX1;
+    const poly = [
+      { x: 0, y: topY },
+      { x: rightX, y: topY },
+      { x: rightX, y: newY1 },
+      { x: 0, y: newY1 },
+    ];
+    if (bottomSpillShard) removeShard(bottomSpillShard);
+    const m = createShardMesh(poly);
+    if (m) {
+      m.userData.spillTopY = topY;
+      shardRoot.add(m);
+      shardMeshes.push(m);
+      bottomSpillShard = m;
+    }
   }
 }
 
@@ -855,7 +1023,12 @@ function disposeShardResources(m) {
 function removeShard(m) {
   const idx = shardMeshes.indexOf(m);
   if (idx >= 0) shardMeshes.splice(idx, 1);
-  sceneRoot.remove(m);
+  // If a spill shard is being removed (fractured or disposed by syncSpillShards
+  // to rebuild at a larger size), forget the reference so the next grow
+  // creates a fresh one instead of trying to mutate a dead mesh.
+  if (m === rightSpillShard) rightSpillShard = null;
+  if (m === bottomSpillShard) bottomSpillShard = null;
+  shardRoot.remove(m);
   disposeShardResources(m);
 }
 
@@ -930,13 +1103,10 @@ function buildCrackLineChild(
   inheritedDanglings,
   centroidX,
   centroidY,
-  buildScrollY,
   clickPoint,
   maxDist,
   parentPolygon,
 ) {
-  const w = source.width;
-  const h = source.height;
   const rect = rootRect;
   const tol = 1.0;
 
@@ -945,11 +1115,11 @@ function buildCrackLineChild(
   const indices = [];
   let vi = 0;
 
-  function toNdcLocal(px, py) {
-    return [
-      (px / w) * 2 - 1 - centroidX,
-      1 - ((py - buildScrollY) / h) * 2 - centroidY,
-    ];
+  // Line mesh is a child of shardMesh, which lives in shardRoot local space
+  // (VP CSS px). Vertices are in CSS px, offset by the shard centroid so the
+  // child's origin matches the parent's origin. Line widths are in CSS px.
+  function toLocal(px, py) {
+    return [px - centroidX, py - centroidY];
   }
 
   function delayFor(px, py) {
@@ -970,10 +1140,10 @@ function buildCrackLineChild(
     const hw0 = w0 / 2,
       hw1 = w1 / 2;
 
-    const [v0x, v0y] = toNdcLocal(x0 + pxNormX * hw0, y0 + pxNormY * hw0);
-    const [v1x, v1y] = toNdcLocal(x0 - pxNormX * hw0, y0 - pxNormY * hw0);
-    const [v2x, v2y] = toNdcLocal(x1 + pxNormX * hw1, y1 + pxNormY * hw1);
-    const [v3x, v3y] = toNdcLocal(x1 - pxNormX * hw1, y1 - pxNormY * hw1);
+    const [v0x, v0y] = toLocal(x0 + pxNormX * hw0, y0 + pxNormY * hw0);
+    const [v1x, v1y] = toLocal(x0 - pxNormX * hw0, y0 - pxNormY * hw0);
+    const [v2x, v2y] = toLocal(x1 + pxNormX * hw1, y1 + pxNormY * hw1);
+    const [v3x, v3y] = toLocal(x1 - pxNormX * hw1, y1 - pxNormY * hw1);
 
     positions.push(v0x, v0y, 0);
     positions.push(v1x, v1y, 0);
@@ -1060,20 +1230,28 @@ function buildCrackLineChild(
 
   const lineMesh = new THREE.Mesh(geom, mat);
   lineMesh.frustumCulled = false;
-  lineMesh.position.z = 0.001;
+  // shardRoot.scale.z = 2/vh, so local z=1 lands at ~0.002 world — a small
+  // positive offset so the crack line renders on top of the shard face at
+  // local z=0 without z-fighting.
+  lineMesh.position.z = 1;
   lineMesh.renderOrder = 3;
   lineMesh.userData.progress = progressNode;
   return lineMesh;
 }
 
 function dropShard(m, delay = 0) {
-  sceneRoot.add(m);
-  const dx = MathUtils.randFloatSpread(0.4);
-  const dy = -8.0 - Math.random() * 4.0;
-  // Drop well past SHARD_FOG_FAR so the TSL fog alpha-fades the shard out —
-  // no separate opacity tween needed. Camera sits at ~+1.7z so a final z of
-  // -80..-120 puts the shard 80..120 units from camera, past the fog far.
-  const dz = -80 - Math.random() * 40;
+  shardRoot.add(m);
+  // XY deltas in shardRoot local (VP CSS px). scale.y = -2/vh, so +y local
+  // = downward on screen → positive dy = fall. Spread x ~120 px (small
+  // lateral drift). Fall ~2-3 viewport heights below.
+  const vh = window.innerHeight;
+  const dx = MathUtils.randFloatSpread(120);
+  const dy = 2 * vh + Math.random() * vh;
+  // shardRoot.scale.z = 2/vh, so local z of (world·vh/2) lands at the given
+  // world distance. Drop well past SHARD_FOG_FAR so the TSL fog alpha-fades
+  // the shard out.
+  const dzWorld = -80 - Math.random() * 40;
+  const dz = (dzWorld * vh) / 2;
   const duration = DROP_DURATION;
   gsap.to(m.position, {
     x: `+=${dx}`,
@@ -1083,7 +1261,7 @@ function dropShard(m, delay = 0) {
     delay,
     ease: 'power2.in',
     onComplete: () => {
-      sceneRoot.remove(m);
+      shardRoot.remove(m);
       disposeShardResources(m);
     },
   });
@@ -1112,7 +1290,6 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
   if (shardMeshes.indexOf(shardMesh) === -1) return created;
 
   const polygon = shardMesh.userData.polygon;
-  const buildScrollY = shardMesh.userData.buildScrollY;
   const inherited = shardMesh.userData.dangleSegs || [];
 
   const faces = computeFaces(shardCracks, polygon);
@@ -1138,7 +1315,6 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
     removeShard(shardMesh);
     const rebuilt = createShardMesh(
       polygon,
-      buildScrollY,
       addedDanglings,
       inherited,
       clickPoint,
@@ -1146,7 +1322,7 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
       polygon,
     );
     if (rebuilt) {
-      sceneRoot.add(rebuilt);
+      shardRoot.add(rebuilt);
       shardMeshes.push(rebuilt);
       created.push(rebuilt);
     }
@@ -1205,7 +1381,6 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
     }
     const newMesh = createShardMesh(
       face,
-      buildScrollY,
       newDanglings,
       inheritedDanglings,
       clickPoint,
@@ -1213,11 +1388,8 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
       polygon,
     );
     if (!newMesh) {
-      // Root cause of #6 edge-shard "instant disappearance": a face from
-      // computeFaces passed the area>1px² gate but still failed createShardMesh
-      // (face<3 or earcut returned 0 indices). Since the parent shard has
-      // already been removed, that region is left blank — the user perceives
-      // the shard as vanishing instead of falling. Warn so we can spot it.
+      // Face passed area gate but failed to mesh (face<3 or earcut returned 0
+      // indices). Parent's already removed, so the region goes blank — warn.
       if (devMode) console.warn('shard face failed to mesh', face);
       continue;
     }
@@ -1225,9 +1397,10 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
 
     const interior = isInteriorPolygon(face, rootRect);
 
+    const area = polygonArea(face);
     const smallEdge =
-      polygonArea(face) <
-        source.width * source.height * EDGE_DROP_MAX_AREA_FRAC &&
+      area <
+        window.innerWidth * window.innerHeight * EDGE_DROP_MAX_AREA_FRAC &&
       Math.random() < EDGE_DROP_PROB;
 
     if (interior || smallEdge) {
@@ -1237,7 +1410,7 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
       droppedArea += polygonArea(face);
       toDrop.push(newMesh);
     } else {
-      sceneRoot.add(newMesh);
+      shardRoot.add(newMesh);
       shardMeshes.push(newMesh);
     }
   }
@@ -1249,7 +1422,6 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
 
 function explodeShards() {
   if (shardMeshes.length === 0) return;
-  exploded = true;
   mesh.visible = false;
   renderer.setClearColor(0x000000, 1);
 
@@ -1258,15 +1430,18 @@ function explodeShards() {
     const len = Math.hypot(c.x, c.y);
     const dx = len > 0.01 ? c.x / len : MathUtils.randFloatSpread(1);
     const dy = len > 0.01 ? c.y / len : MathUtils.randFloatSpread(1);
-    const outDist = Math.random() * 0.08;
+    // Outward drift in VP CSS px (shardRoot local xy).
+    const outDist = Math.random() * 40;
 
     const dur = 3 + Math.random() * 1.5;
     const delay = Math.random() * 1.0;
 
+    const vh = window.innerHeight;
+    const zWorld = -(15 + Math.random() * 10);
     gsap.to(m.position, {
       x: `+=${dx * outDist}`,
       y: `+=${dy * outDist}`,
-      z: -(15 + Math.random() * 10),
+      z: (zWorld * vh) / 2,
       duration: dur,
       delay,
       ease: 'power2.in',
@@ -1284,14 +1459,12 @@ function explodeShards() {
 
 function resetShards() {
   if (shardMeshes.length === 0) return;
-  exploded = false;
   for (const m of shardMeshes) {
     gsap.killTweensOf(m.position);
     gsap.killTweensOf(m.rotation);
     m.position.set(m.userData.centroid.x, m.userData.centroid.y, 0);
     m.rotation.set(0, 0, 0);
   }
-  updateShardScroll();
 }
 
 function tiltShards() {
@@ -1338,6 +1511,10 @@ renderer.autoClear = false;
 let firstFrame = true;
 renderer.setAnimationLoop(() => {
   stats.update();
+  // #stage is position:fixed so the browser pins the canvas to the viewport
+  // on the compositor — no main-thread transform sync needed here. Just feed
+  // the shader the current scrollY so UV sampling tracks document scroll.
+  scrollYU.value = window.scrollY;
   if (controls.enabled) controls.update();
   if (tunnelApi) {
     timer.update();

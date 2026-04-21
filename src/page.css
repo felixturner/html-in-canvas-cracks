@@ -39,6 +39,8 @@ html[data-theme='light'] {
 }
 
 #theme-toggle {
+  flex: 0 0 28px;
+  margin-right: auto;
   width: 28px;
   height: 28px;
   border-radius: 50%;
@@ -54,10 +56,10 @@ html[data-theme='light'] {
   padding: 0;
 }
 #theme-toggle::before {
-  content: '☾';
+  content: '☀';
 }
 [data-theme='light'] #theme-toggle::before {
-  content: '☀';
+  content: '☾';
 }
 #theme-toggle-hit {
   position: fixed;
@@ -84,11 +86,20 @@ body {
   background: var(--bg);
   color: var(--fg);
   overflow-x: hidden;
-  font:
-    14px/1.5 -apple-system,
-    'Segoe UI',
-    system-ui,
-    sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica,
+    Arial, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji';
+  font-size: 14px;
+  line-height: 1.5;
+}
+code,
+kbd,
+pre,
+samp {
+  font-family:
+    ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+  font-size: 85%;
 }
 
 /* ---------- canvases (same page, webgpu overlay on left half) ---------- */
@@ -105,10 +116,12 @@ body {
 }
 
 #stage {
-  /* position:absolute (not fixed) so #stage rides the document compositor
-     layer and inherits macOS rubber-band bounce. JS keeps it visually locked
-     to the viewport by setting transform: translateY(scrollY) on scroll. */
-  position: absolute;
+  /* position:fixed so the browser pins the canvas to the viewport on the
+     compositor thread. With position:absolute we'd have to re-apply
+     transform: translateY(scrollY) every frame from the main thread, which
+     lags the compositor-scroll and makes VP-locked shards appear to shift
+     vertically during scroll before resettling. */
+  position: fixed;
   top: 0;
   left: 0;
   width: 100vw;
@@ -205,14 +218,9 @@ body.ready #source {
   color: var(--fg);
   min-height: 100vh;
   width: 100vw;
+  padding-right: calc(100vw - 100%);
 }
 
-.gh-topnav,
-.gh-repo-header,
-.gh-main,
-.gh-footer {
-  width: 100vw;
-}
 
 #debug {
   position: fixed;
@@ -243,11 +251,9 @@ body.ready #source {
 }
 
 .gh-topnav-inner {
-  max-width: 1280px;
-  margin: 0 auto;
   box-sizing: border-box;
-  padding: 0 24px;
-  height: 64px;
+  padding: 0 32px 0 16px;
+  height: 56px;
   display: flex;
   align-items: center;
   gap: 16px;
@@ -258,15 +264,36 @@ body.ready #source {
   display: inline-flex;
 }
 
+.gh-topnav-crumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+}
+.gh-topnav-crumb a {
+  color: var(--fg);
+  text-decoration: none;
+}
+.gh-topnav-crumb .gh-repo-strong {
+  font-weight: 600;
+}
+
 .gh-topnav-search {
-  flex: 1;
-  max-width: 420px;
+  margin-left: auto;
+  width: 240px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 5px 12px;
   color: var(--fg-muted);
   font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.gh-search-icon {
+  color: var(--fg-muted);
+  flex: 0 0 auto;
 }
 .gh-topnav-search kbd {
   border: 1px solid var(--border);
@@ -293,42 +320,77 @@ body.ready #source {
 .gh-topnav-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-left: auto;
+  gap: 2px;
 }
-.gh-icon-btn {
+.gh-nav-icon,
+.gh-nav-icon-group {
+  background: transparent;
+  border: 1px solid var(--border);
   color: var(--fg-muted);
-  font-size: 18px;
+  height: 32px;
+  min-width: 32px;
+  padding: 0 10px;
   cursor: pointer;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.gh-nav-icon:hover,
+.gh-nav-icon-group:hover {
+  background: var(--btn-bg-hover);
+  color: var(--fg);
+}
+.gh-nav-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--border);
+  margin: 0 6px;
+}
+.gh-nav-notif {
+  position: relative;
+}
+.gh-nav-notif::after {
+  content: '';
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--link);
+  border: 2px solid var(--bg-elev);
 }
 .gh-avatar {
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
+  border: 1px solid var(--border);
   background: #ec1e79 url(/felix.png) center/contain no-repeat;
+  margin-left: 6px;
 }
 
 /* repo header */
 .gh-repo-header {
-  background: var(--bg-elev);
-  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  padding: 0 16px;
 }
 .gh-repo-inner {
-  max-width: 1280px;
+  max-width: 1220px;
   margin: 0 auto;
   box-sizing: border-box;
-  padding: 16px 24px 0;
+  padding: 12px 0;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  border-bottom: 1px solid var(--border);
 }
 .gh-tabs-wrap {
-  max-width: 1280px;
-  margin: 0 auto;
   box-sizing: border-box;
-  padding: 0 24px;
+  padding: 0 16px;
 }
 .gh-repo-name {
   font-size: 20px;
@@ -337,11 +399,22 @@ body.ready #source {
   color: var(--fg);
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
+}
+.gh-repo-owner-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: #ec1e79 url(/felix.png) center/contain no-repeat;
+  flex: 0 0 24px;
 }
 .gh-repo-name a {
-  color: var(--link);
+  color: var(--fg);
   text-decoration: none;
+}
+.gh-repo-name a:hover {
+  text-decoration: underline;
 }
 .gh-repo-strong {
   font-weight: 600;
@@ -392,6 +465,10 @@ body.ready #source {
   display: flex;
   gap: 8px;
   overflow-x: auto;
+  scrollbar-width: none;
+}
+.gh-tabs::-webkit-scrollbar {
+  display: none;
 }
 .gh-tab {
   padding: 8px 12px;
@@ -424,15 +501,17 @@ body.ready #source {
   margin-left: 2px;
 }
 .gh-goto-file {
-  flex: 1 1 180px;
+  flex: 0 1 272px;
   min-width: 180px;
   max-width: 320px;
+  margin-left: auto;
   background: var(--btn-bg);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 5px 12px;
+  padding: 0 12px;
+  height: 32px;
   color: var(--fg-muted);
-  font-size: 13px;
+  font-size: 14px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -448,8 +527,10 @@ body.ready #source {
   color: var(--fg);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 5px 12px;
-  font: 600 12px/20px inherit;
+  padding: 0 12px;
+  height: 32px;
+  font-size: 14px;
+  font-weight: 500;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -523,21 +604,21 @@ body.ready #source {
   width: 24px;
   height: 24px;
   border-radius: 50%;
+  border: 1px solid var(--border);
   background: #ec1e79 url(/felix.png) center/contain no-repeat;
 }
 
 /* main */
 .gh-main {
-  padding: 24px 0;
+  padding: 24px 16px;
 }
 .gh-main-inner {
   display: grid;
-  grid-template-columns: 1fr 296px;
+  grid-template-columns: 1fr clamp(220px, 24%, 296px);
   gap: 24px;
-  max-width: 1280px;
+  max-width: 1220px;
   margin: 0 auto;
   box-sizing: border-box;
-  padding: 0 24px;
 }
 
 /* code header */
@@ -554,21 +635,42 @@ body.ready #source {
   color: var(--fg);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 5px 12px;
-  font: 600 12px/20px inherit;
+  padding: 0 12px;
+  height: 32px;
+  font-size: 14px;
+  font-weight: 500;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .gh-code-btn {
-  background: #238636;
-  border-color: #2ea043;
-  margin-left: auto;
+  background: #1f883d;
+  border-color: rgba(31, 35, 40, 0.15);
+  color: #ffffff;
+  font-weight: 600;
+  padding: 0 16px;
+}
+.gh-code-btn .gh-caret {
   color: #ffffff;
 }
+.gh-code-btn:hover {
+  background: #1a7f37;
+}
 .gh-file-meta {
-  color: var(--fg-muted);
-  font-size: 12px;
+  color: var(--fg);
+  font-size: 14px;
   display: flex;
+  align-items: center;
   gap: 16px;
+}
+.gh-file-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.gh-file-meta svg {
+  color: var(--fg-muted);
 }
 
 /* file list */
@@ -584,23 +686,41 @@ body.ready #source {
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   font-size: 12px;
+  min-width: 0;
 }
 .gh-committer {
+  flex: 0 0 20px;
   width: 20px;
   height: 20px;
   border-radius: 50%;
+  border: 1px solid var(--border);
   background: #ec1e79 url(/felix.png) center/contain no-repeat;
 }
 .gh-committer-name {
+  flex: 0 0 auto;
   color: var(--fg);
   font-weight: 600;
 }
 .gh-commit-msg {
+  flex: 1 1 0;
+  min-width: 0;
   color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gh-commit-sha,
+.gh-commit-age {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+.gh-commit-age {
+  margin-left: 0;
 }
 .gh-commit-count {
+  flex: 0 0 auto;
   margin-left: auto;
   color: var(--fg-muted);
 }
@@ -616,7 +736,7 @@ body.ready #source {
   align-items: center;
   gap: 12px;
   padding: 8px 16px;
-  font-size: 13px;
+  font-size: 14px;
   border-top: 1px solid var(--border-muted);
 }
 .gh-files li:first-child {
@@ -661,34 +781,58 @@ body.ready #source {
   overflow: hidden;
 }
 .md-header {
-  background: var(--bg-elev);
+  background: var(--bg);
   padding: 12px 16px;
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 14px;
+  font-weight: 600;
   color: var(--fg);
+  position: relative;
+}
+.md-header > span:nth-of-type(1)::after {
+  content: '';
+  position: absolute;
+  left: 16px;
+  bottom: -1px;
+  width: 56px;
+  height: 2px;
+  background: var(--accent);
 }
 .md-header-meta {
   color: var(--fg-muted);
-  font-size: 12px;
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
 }
 .md-body {
   padding: 32px 48px;
+  font-size: 16px;
+  line-height: 1.5;
 }
 .md-body h1 {
-  font-size: 32px;
+  font-size: 2em;
+  font-weight: 600;
+  line-height: 1.25;
   margin: 0 0 16px;
-  padding-bottom: 8px;
+  padding-bottom: 0.3em;
   border-bottom: 1px solid var(--border-muted);
 }
 .md-body h2 {
-  font-size: 24px;
+  font-size: 1.5em;
+  font-weight: 600;
+  line-height: 1.25;
   margin: 24px 0 16px;
-  padding-bottom: 8px;
+  padding-bottom: 0.3em;
   border-bottom: 1px solid var(--border-muted);
+}
+.md-body h3 {
+  font-size: 1.25em;
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 24px 0 16px;
 }
 .md-body p {
   margin: 0 0 16px;
@@ -715,13 +859,16 @@ body.ready #source {
   margin: 0 0 16px;
 }
 .md-body code {
-  font:
-    12px/1.45 ui-monospace,
-    'SF Mono',
-    Menlo,
-    Consolas,
-    monospace;
+  padding: 0.2em 0.4em;
+  font-size: 85%;
+  background: var(--bg-code);
+  border-radius: 6px;
   color: var(--fg);
+}
+.md-body pre code {
+  padding: 0;
+  background: transparent;
+  font-size: 100%;
 }
 .md-body strong {
   color: var(--fg);
@@ -779,7 +926,7 @@ html[data-theme='light'] .markdown-alert-warning {
   text-decoration: none;
 }
 .md-live-demo a:hover {
-  text-decoration: underline;
+  text-decoration: none;
 }
 
 /* sidebar */
@@ -866,18 +1013,16 @@ html[data-theme='light'] .markdown-alert-warning {
 
 /* footer */
 .gh-footer {
-  border-top: 1px solid var(--border);
   margin-top: 48px;
   padding: 24px 0;
 }
 .gh-footer-inner {
-  max-width: 1280px;
   margin: 0 auto;
   box-sizing: border-box;
   padding: 0 24px;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   flex-wrap: wrap;
   gap: 16px;
 }
@@ -897,11 +1042,12 @@ html[data-theme='light'] .markdown-alert-warning {
   gap: 16px;
 }
 .gh-footer-nav a {
-  color: var(--link);
+  color: var(--fg-muted);
   text-decoration: none;
   font-size: 12px;
 }
 .gh-footer-nav a:hover {
+  color: var(--link);
   text-decoration: underline;
 }
 
@@ -919,7 +1065,7 @@ html[data-theme='light'] .markdown-alert-warning {
     sans-serif;
 }
 #warning h1 {
-  color: var(--accent);
+  color: var(--fg-muted);
   font-size: 22px;
   margin: 0 0 12px;
 }
@@ -933,19 +1079,68 @@ html[data-theme='light'] .markdown-alert-warning {
     monospace;
 }
 
-@media (max-width: 900px) {
-  .gh-topnav-inner {
-    padding: 0 16px;
-    gap: 8px;
-  }
-  .gh-topnav-search,
-  .gh-topnav-links {
+@media (max-width: 1120px) {
+  .gh-topnav-search {
     display: none;
   }
+  .gh-topnav-actions {
+    margin-left: auto;
+  }
+  .gh-file-meta,
+  .gh-goto-file,
+  .gh-add-file-btn {
+    display: none;
+  }
+  .gh-code-header {
+    flex-wrap: wrap;
+  }
+  .gh-code-btn {
+    margin-left: auto;
+  }
+}
+
+@media (max-width: 900px) {
+  .gh-topnav-inner {
+    padding: 0 18px;
+    gap: 8px;
+  }
+  .gh-topnav-links,
+  .gh-topnav-search {
+    display: none;
+  }
+  .gh-topnav-actions .gh-nav-icon-group,
+  .gh-topnav-actions .gh-nav-divider,
+  .gh-topnav-actions .gh-nav-icon:not(.gh-nav-notif) {
+    display: none;
+  }
+  .gh-goto-file,
+  .gh-add-file-btn {
+    display: none;
+  }
+  .gh-topnav-crumb {
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+  .gh-topnav-crumb a:first-child {
+    font-size: 0;
+    flex: 0 0 auto;
+  }
+  .gh-topnav-crumb a:first-child::before {
+    content: '···';
+    font-size: 14px;
+    color: var(--fg-muted);
+  }
+  .gh-topnav-crumb .gh-repo-strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
   .gh-repo-inner {
-    padding: 16px 16px 0;
+    padding: 16px 18px 0;
     flex-direction: column;
     align-items: stretch;
+    border-bottom: none;
   }
   .gh-repo-name {
     flex-wrap: wrap;
@@ -958,12 +1153,12 @@ html[data-theme='light'] .markdown-alert-warning {
     display: none;
   }
   .gh-tabs-wrap {
-    padding: 0 16px;
+    padding: 0 18px;
   }
   .gh-main-inner {
     display: flex;
     flex-direction: column;
-    padding: 0 16px;
+    padding: 0 18px;
   }
   .gh-sidebar {
     order: -1;
