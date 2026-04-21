@@ -1,6 +1,6 @@
 html,
 body {
-  background: #000;
+  background: var(--bg);
 }
 
 #native-page {
@@ -129,7 +129,13 @@ samp {
   display: block;
   pointer-events: none;
   z-index: 10;
-  background: #000;
+  /* Hidden until the first HTML texture paint lands (body.ready). Avoids a
+     black flash in light mode — the themed html/body bg shows through until
+     the 3D composite has real content to display. */
+  opacity: 0;
+}
+body.ready #stage {
+  opacity: 1;
 }
 
 body.ready #source {
@@ -946,6 +952,10 @@ html[data-theme='light'] .markdown-alert-warning {
   font-size: 14px;
   color: var(--fg-muted);
   margin: 0 0 12px;
+}
+.gh-sidebar-section > p:not(.gh-sidebar-link):not(.gh-sidebar-note) {
+  font-size: 16px;
+  color: var(--fg);
 }
 .gh-sidebar-link {
   color: var(--link) !important;

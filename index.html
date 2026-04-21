@@ -3,8 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      // Set initial theme from the OS preference before CSS applies so the
+      // first paint matches. User can still flip it via the theme toggle.
+      document.documentElement.setAttribute(
+        'data-theme',
+        window.matchMedia('(prefers-color-scheme: light)').matches
+          ? 'light'
+          : 'dark',
+      );
+    </script>
     <link rel="icon" type="image/x-icon" href="./favicon.ico" />
-    <title>html-in-canvas · rgb split</title>
+    <title>html-in-canvas-cracks demo</title>
     <link rel="stylesheet" href="/src/page.css" />
   </head>
   <body>
@@ -567,23 +577,6 @@
                       <path
                         d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"
                       /></svg></span
-                  ><a>todo.md</a
-                  ><span class="gh-msg"
-                    >Remove CA, env lighting, GUI; fix boot, resize, fog,
-                    bounce</span
-                  ><span class="gh-age">2 hours ago</span>
-                </li>
-                <li>
-                  <span class="gh-file-icon"
-                    ><svg
-                      width="16"
-                      height="16"
-                      viewBox="0 0 16 16"
-                      fill="currentColor"
-                    >
-                      <path
-                        d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0 1 13.25 16h-9.5A1.75 1.75 0 0 1 2 14.25Zm1.75-.25a.25.25 0 0 0-.25.25v12.5c0 .138.112.25.25.25h9.5a.25.25 0 0 0 .25-.25V6h-2.75A1.75 1.75 0 0 1 9 4.25V1.5Zm6.75.062V4.25c0 .138.112.25.25.25h2.688l-.011-.013-2.914-2.914-.013-.011Z"
-                      /></svg></span
                   ><a>vite.config.js</a
                   ><span class="gh-msg"
                     >Add GitHub Pages deploy workflow + vite base path</span
@@ -700,6 +693,14 @@
                 </p>
                 <ul>
                   <li>
+                    <strong>Foreground RT.</strong> The HTML-textured base
+                    plane (pre-crack) or the shard meshes (post-crack) render
+                    alone into a transparent render target with depth. That
+                    isolation matters for compositing: the tunnel shows
+                    through wherever foreground alpha = 0 (e.g. through holes
+                    left by fallen shards).
+                  </li>
+                  <li>
                     <strong>Tunnel + feedback RT.</strong> A separate 3D scene
                     filled with drifting, fog-faded text quads (the "code
                     tunnel") renders into a half-float render target. Before
@@ -708,14 +709,6 @@
                     this is a manual temporal feedback pass, giving every
                     glowing element a long, exponential trail without any
                     post-pass.
-                  </li>
-                  <li>
-                    <strong>Foreground RT.</strong> The HTML-textured base
-                    plane (pre-crack) or the shard meshes (post-crack) render
-                    alone into a transparent render target with depth. That
-                    isolation matters for compositing: the tunnel shows
-                    through wherever foreground alpha = 0 (e.g. through holes
-                    left by fallen shards).
                   </li>
                   <li>
                     <strong>Composite.</strong> <code>PostProcessing</code>
@@ -924,26 +917,19 @@ uv    = vec2(vpPx.x / sourceCssW, 1 - docY / sourceCssH)</code></pre>
                 </ul>
                 <p>
                   Add <code>?dev</code> to the URL for the debug overlay,
-                  Stats panel, and the draggable split dividers that let you
-                  slide between the 3D composite and the raw DOM.
+                  Stats panel, and two draggable split dividers that slice
+                  the viewport into three panes — GPU composite, source
+                  canvas, and raw HTML — so you can see each stage of the
+                  pipeline side-by-side.
                 </p>
                 <h2>Tech Stack</h2>
                 <ul>
+                  <li><a>three.js</a> WebGPU renderer + TSL</li>
+                  <li><a>earcut</a> for polygon triangulation</li>
+                  <li><a>GSAP</a> for timed animations</li>
                   <li>
-                    <a href="https://threejs.org">three.js</a> WebGPU
-                    renderer + TSL
-                  </li>
-                  <li>
-                    <a href="https://github.com/mapbox/earcut">earcut</a> for
-                    polygon triangulation
-                  </li>
-                  <li>
-                    <a href="https://greensock.com/gsap/">GSAP</a> for timed
-                    animations
-                  </li>
-                  <li>
-                    <a href="https://vitejs.dev">Vite</a> for the dev server
-                    and <code>?raw</code> imports
+                    <a>Vite</a> for the dev server and
+                    <code>?raw</code> imports
                   </li>
                   <li>Chrome's draw-element canvas API</li>
                 </ul>

@@ -1,4 +1,4 @@
-# html-in-canvas
+# html-in-canvas-cracks
 
 Real HTML, real layout, real scrolling — rendered through a WebGPU pipeline
 with TSL shaders, feedback trails, and a live 3D code tunnel in the
@@ -40,16 +40,16 @@ This project wires that pipeline up end-to-end:
 
 Each frame goes through a few render targets before hitting the screen:
 
+- **Foreground RT.** The HTML-textured base plane (pre-crack) or the shard
+  meshes (post-crack) render alone into a transparent render target with
+  depth. That isolation matters for compositing: the tunnel shows through
+  wherever foreground alpha = 0 (e.g. through holes left by fallen shards).
 - **Tunnel + feedback RT.** A separate 3D scene filled with drifting,
   fog-faded text quads (the "code tunnel") renders into a half-float render
   target. Before the tunnel draws, a full-screen quad with a slightly dim
   decay multiplier overwrites the previous frame in place — this is a manual
   temporal feedback pass, giving every glowing element a long, exponential
   trail without any post-pass.
-- **Foreground RT.** The HTML-textured base plane (pre-crack) or the shard
-  meshes (post-crack) render alone into a transparent render target with
-  depth. That isolation matters for compositing: the tunnel shows through
-  wherever foreground alpha = 0 (e.g. through holes left by fallen shards).
 - **Composite.** `PostProcessing` with a TSL `outputNode` layers the
   feedback RT and the foreground RT together through a `BloomNode`. Bloom is
   scoped to the background scene so the HTML stays crisp at its native
@@ -180,8 +180,10 @@ Keyboard:
 - `t` — apply a small random tilt to each shard.
 - `o` — toggle OrbitControls on the camera (for debugging).
 
-Add `?dev` to the URL for the debug overlay, Stats panel, and the draggable
-split dividers that let you slide between the 3D composite and the raw DOM.
+Add `?dev` to the URL for the debug overlay, Stats panel, and two draggable
+split dividers that slice the viewport into three panes — GPU composite,
+source canvas, and raw HTML — so you can see each stage of the pipeline
+side-by-side.
 
 ## Tech Stack
 

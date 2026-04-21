@@ -12,6 +12,7 @@ import {
   positionLocal,
   positionView,
   smoothstep,
+  mix,
 } from 'three/tsl';
 import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 import Stats from 'three/addons/libs/stats.module.js';
@@ -129,8 +130,12 @@ const fgRT = new THREE.RenderTarget(1, 1, {
 const decayScene = new THREE.Scene();
 const decayCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const decayAlphaU = uniform(0.26);
-const crackColorU = uniform(1.0);
-const crackOpacityU = uniform(0.1);
+// Crack color/opacity match the initial data-theme set by the inline script
+// in index.html (OS prefers-color-scheme). Toggle handler keeps them in sync.
+const initialLight =
+  document.documentElement.getAttribute('data-theme') === 'light';
+const crackColorU = uniform(initialLight ? 0.0 : 1.0);
+const crackOpacityU = uniform(initialLight ? 0.2 : 0.1);
 const decayMat = new THREE.MeshBasicNodeMaterial({
   transparent: true,
   depthTest: false,
@@ -166,10 +171,28 @@ let mesh = null;
 // crack repaints a fresh full-screen HTML plane behind the shards, which
 // covers the tunnel that should be visible through dropped-shard holes.
 let hasCracked = false;
-// Screen mesh outputs opaque black until the html texture has been painted
-// at least once. Keeps fgRT alpha = 1 so the tunnel never bleeds through
-// during init.
+// Screen mesh outputs the themed page bg until the html texture has been
+// painted at least once. Keeps fgRT alpha = 1 so the tunnel never bleeds
+// through during init, and avoids a black flash in light mode before the
+// first HTML texture upload.
 const screenReadyU = uniform(0);
+const bgColorU = uniform(new THREE.Color(0x000000));
+// Read the current CSS --bg (themed by data-theme) into a THREE.Color. Called
+// on boot and whenever the theme toggles so the GPU clear + screen mesh boot
+// color follow the page.
+function readBgColor() {
+  const s = getComputedStyle(document.documentElement)
+    .getPropertyValue('--bg')
+    .trim();
+  const c = new THREE.Color();
+  try {
+    c.set(s);
+  } catch {
+    c.set(0x000000);
+  }
+  return c;
+}
+bgColorU.value.copy(readBgColor());
 
 function createPipeline() {
   if (mesh) {
@@ -194,7 +217,10 @@ function createPipeline() {
 
   const material = new THREE.MeshBasicNodeMaterial();
   const tex = texture(htmlTexture, uv());
-  material.colorNode = vec4(tex.rgb.mul(screenReadyU), 1);
+  // Until the first paint lands (screenReadyU=0) output the themed page bg
+  // so the canvas doesn't flash black between the #stage opacity reveal and
+  // the first HTML texture upload. Mix to the real texture once it's ready.
+  material.colorNode = vec4(mix(bgColorU, tex.rgb, screenReadyU), 1);
 
   mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
   if (hasCracked) mesh.visible = false;
@@ -223,7 +249,7 @@ const renderer = new THREE.WebGPURenderer({
   requiredLimits: { maxTextureDimension2D: maxTex },
 });
 await renderer.init();
-renderer.setClearColor(0x000000, 1);
+renderer.setClearColor(bgColorU.value, 1);
 
 const controls = new OrbitControls(camera, stage);
 controls.enabled = false;
@@ -542,6 +568,10 @@ themeToggle.addEventListener('click', () => {
   );
   crackColorU.value = nextLight ? 0.0 : 1.0;
   crackOpacityU.value = nextLight ? 0.2 : 0.1;
+  // Refresh the GPU bg color so the screen-mesh boot color, renderer clear,
+  // and fg-RT composite clear all follow the new theme.
+  bgColorU.value.copy(readBgColor());
+  renderer.setClearColor(bgColorU.value, 1);
   schedulePaint();
 });
 window.addEventListener('resize', resize);
@@ -1423,7 +1453,7 @@ function fractureShardWithCracks(shardMesh, shardCracks, clickPoint, maxDist) {
 function explodeShards() {
   if (shardMeshes.length === 0) return;
   mesh.visible = false;
-  renderer.setClearColor(0x000000, 1);
+  renderer.setClearColor(bgColorU.value, 1);
 
   for (const m of shardMeshes) {
     const c = m.userData.centroid || { x: 0, y: 0 };
@@ -1542,7 +1572,7 @@ renderer.setAnimationLoop(() => {
     renderer.autoClearDepth = true;
     renderer.clear();
     renderer.render(scene, camera);
-    renderer.setClearColor(0x000000, 1);
+    renderer.setClearColor(bgColorU.value, 1);
     // 3) postProcessing outputNode composites bloom + fg → screen.
     renderer.setRenderTarget(null);
     postProcessing.render();
